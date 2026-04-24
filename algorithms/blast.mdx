@@ -1,0 +1,374 @@
+---
+title: "BLAST: Sequence Similarity Search in C++ Toolkit"
+description: "Run BLAST searches programmatically using CLocalBlast, CBlastOptionsHandle, and CSearchDatabase. Covers blastn, blastp, blastx, tblastn, tblastx, and megablast."
+---
+
+The NCBI C++ Toolkit provides a full-featured programmatic interface to BLAST (Basic Local Alignment Search Tool), allowing applications to run nucleotide and protein similarity searches locally against BLAST databases or in-memory sequence sets. The API centers on three concerns: specifying the program and its options, describing the query and subject sequences, and traversing the resulting alignments.
+
+## Architecture overview
+
+A BLAST search in the C++ Toolkit involves four main components:
+
+- **`CBlastOptionsHandle`** — holds all algorithm parameters for a given program type
+- **`IQueryFactory`** / **`CBlastQueryVector`** — packages one or more query sequences
+- **`CSearchDatabase`** / **`CLocalDbAdapter`** — describes the subject database
+- **`CLocalBlast`** — orchestrates the preliminary and traceback stages, returning a `CSearchResultSet`
+
+All classes live in `namespace ncbi::blast` and are declared under `include/algo/blast/api/`.
+
+## Program types
+
+<Tabs>
+  <Tab title="Nucleotide (blastn / megablast)">
+    `eBlastn` performs traditional blastn with a word size of 11 and penalty/reward scoring. `eMegablast` (the default when constructing `CBlastNucleotideOptionsHandle`) uses a word size of 28 and is optimised for highly similar sequences.
+
+    ```cpp
+    #include <algo/blast/api/blast_nucl_options.hpp>
+
+    using namespace ncbi::blast;
+
+    // Megablast defaults (word size 28)
+    CRef<CBlastNucleotideOptionsHandle> opts(
+        new CBlastNucleotideOptionsHandle);
+
+    // Switch to traditional blastn defaults (word size 11)
+    opts->SetTraditionalBlastnDefaults();
+
+    // Or use the factory for any EProgram value
+    CRef<CBlastOptionsHandle> opts2(
+        CBlastOptionsFactory::Create(eBlastn));
+    ```
+
+    Key nucleotide-specific setters:
+
+    | Method | Description |
+    |---|---|
+    | `SetWordSize(int)` | Seed word length (default 28 for megablast, 11 for blastn) |
+    | `SetMatchReward(int)` | Score for a nucleotide match |
+    | `SetMismatchPenalty(int)` | Penalty for a mismatch (negative integer) |
+    | `SetGapOpeningCost(int)` | Affine gap open penalty |
+    | `SetGapExtensionCost(int)` | Affine gap extension penalty |
+    | `SetDustFiltering(bool)` | Enable/disable DUST low-complexity filter |
+    | `SetStrandOption(ENa_strand)` | Restrict search to one strand |
+  </Tab>
+
+  <Tab title="Protein (blastp)">
+    `eBlastp` searches a protein query against a protein database. The handle class is `CBlastProteinOptionsHandle`.
+
+    ```cpp
+    #include <algo/blast/api/blast_prot_options.hpp>
+
+    CRef<CBlastProteinOptionsHandle> opts(
+        new CBlastProteinOptionsHandle);
+
+    opts->SetMatrixName("BLOSUM62");
+    opts->SetGapOpeningCost(11);
+    opts->SetGapExtensionCost(1);
+    opts->SetEvalueThreshold(1e-5);
+    opts->SetSegFiltering(true);   // SEG low-complexity filter
+    ```
+  </Tab>
+
+  <Tab title="Translated (blastx / tblastn / tblastx)">
+    `eBlastx` translates a nucleotide query into all six frames and searches against a protein database. `eTblastn` searches a protein query against a translated nucleotide database. `eTblastx` translates both query and database.
+
+    ```cpp
+    #include <algo/blast/api/blastx_options.hpp>
+    #include <algo/blast/api/blast_options_handle.hpp>
+
+    // blastx: translated nucleotide query vs protein database
+    CRef<CBlastOptionsHandle> blastx_opts(
+        CBlastOptionsFactory::Create(eBlastx));
+
+    // tblastn: protein query vs translated nucleotide database
+    CRef<CBlastOptionsHandle> tblastn_opts(
+        CBlastOptionsFactory::Create(eTblastn));
+    ```
+  </Tab>
+
+  <Tab title="PSI-BLAST / RPS-BLAST">
+    Position-Specific Iterated BLAST (`ePSIBlast`) builds a PSSM from an initial blastp search and iterates. RPS-BLAST (`eRPSBlast`) searches a query against a database of PSSMs (e.g., CDD).
+
+    ```cpp
+    #include <algo/blast/api/psiblast_options.hpp>
+    #include <algo/blast/api/blast_rps_options.hpp>
+
+    CRef<CBlastOptionsHandle> psi_opts(
+        CBlastOptionsFactory::Create(ePSIBlast));
+
+    CRef<CBlastOptionsHandle> rps_opts(
+        CBlastOptionsFactory::Create(eRPSBlast));
+    ```
+  </Tab>
+</Tabs>
+
+## CBlastOptionsHandle
+
+`CBlastOptionsHandle` is the abstract base class for all program-specific option handles. It exposes settings that are common to every BLAST program type.
+
+```cpp
+#include <algo/blast/api/blast_options_handle.hpp>
+
+CRef<CBlastNucleotideOptionsHandle> opts(
+    new CBlastNucleotideOptionsHandle);
+
+// Hit-saving parameters
+opts->SetEvalueThreshold(1e-10);   // maximum E-value to report
+opts->SetHitlistSize(500);          // max hits per query
+opts->SetPercentIdentity(90.0);     // minimum % identity filter
+
+// Gapped alignment
+opts->SetGappedMode(true);
+opts->SetGapXDropoff(30.0);
+opts->SetGapXDropoffFinal(100.0);
+
+// Effective search space (override automatic calculation)
+opts->SetEffectiveSearchSpace(0);  // 0 = compute automatically
+
+// Validate before searching
+if (!opts->Validate()) {
+    // handle invalid options
+}
+```
+
+The `CBlastOptionsFactory` convenience class creates handles pre-loaded with defaults for a given `EProgram` or named task string:
+
+```cpp
+// By EProgram enum
+CRef<CBlastOptionsHandle> h1(CBlastOptionsFactory::Create(eMegablast));
+
+// By task name string (matches BLAST+ command-line task names)
+CRef<CBlastOptionsHandle> h2(CBlastOptionsFactory::CreateTask("dc-megablast"));
+
+// List all available task names
+set<string> tasks = CBlastOptionsFactory::GetTasks(
+    CBlastOptionsFactory::eNuclNucl);
+```
+
+## Query sequences: SSeqLoc and CBlastQueryVector
+
+Each query is represented by an `SSeqLoc` — a pairing of a `CSeq_loc` describing the region to search and a `CScope` that provides access to the sequence data. For multiple queries, collect them into a `TSeqLocVector` and wrap them in a `CObjMgr_QueryFactory`.
+
+```cpp
+#include <algo/blast/api/sseqloc.hpp>
+#include <algo/blast/api/objmgr_query_data.hpp>
+#include <objmgr/object_manager.hpp>
+#include <objmgr/scope.hpp>
+
+// Set up the object manager and scope
+CRef<CObjectManager> objmgr = CObjectManager::GetInstance();
+CRef<CScope> scope(new CScope(*objmgr));
+scope->AddDefaults();
+
+// Fetch a sequence by accession
+CRef<CSeq_loc> seqloc = /* ... build or fetch ... */;
+
+// SSeqLoc pairs the location with its scope
+SSeqLoc query_seqloc(seqloc, scope);
+
+// Build a vector of queries
+TSeqLocVector queries;
+queries.push_back(query_seqloc);
+
+// Wrap in a query factory for CLocalBlast
+CRef<IQueryFactory> query_factory(
+    new CObjMgr_QueryFactory(queries));
+```
+
+For finer control — such as adding pre-computed masked regions — use `CBlastQueryVector` and `CBlastSearchQuery` directly:
+
+```cpp
+#include <algo/blast/api/sseqloc.hpp>
+
+CRef<CBlastQueryVector> qvec(new CBlastQueryVector);
+
+CRef<CBlastSearchQuery> bsq(
+    new CBlastSearchQuery(*seqloc, *scope));
+
+// Optionally attach pre-computed mask regions
+// bsq->SetMaskedRegions(masked_regions);
+
+qvec->AddQuery(bsq);
+
+CRef<IQueryFactory> qf(new CObjMgr_QueryFactory(*qvec));
+```
+
+## Subject database: CSearchDatabase
+
+`CSearchDatabase` describes a BLAST-formatted database on disk.
+
+```cpp
+#include <algo/blast/api/local_db_adapter.hpp>
+
+// Nucleotide database
+CSearchDatabase db(
+    "nt",                              // database name/path
+    CSearchDatabase::eBlastDbIsNucleotide);
+
+// Protein database
+CSearchDatabase prot_db(
+    "/data/blast/nr",
+    CSearchDatabase::eBlastDbIsProtein);
+
+// Limit to a specific GI list
+// db.SetGiList(gi_list);
+```
+
+## Running a search: CLocalBlast
+
+`CLocalBlast` combines the query factory, options handle, and database description to execute the search. Its `Run()` method returns a `CRef<CSearchResultSet>`.
+
+```cpp
+#include <algo/blast/api/local_blast.hpp>
+
+CRef<CLocalBlast> blast(
+    new CLocalBlast(query_factory, opts, db));
+
+CRef<CSearchResultSet> results = blast->Run();
+
+// Check for search-level errors or warnings
+TSearchMessages msgs = blast->GetSearchMessages();
+```
+
+## Reading results: CSearchResultSet and CSearchResults
+
+`CSearchResultSet` is an indexed container of `CSearchResults` objects — one per query. Each `CSearchResults` holds the `CSeq_align_set` of HSPs for that query.
+
+```cpp
+#include <algo/blast/api/blast_results.hpp>
+#include <objects/seqalign/Seq_align_set.hpp>
+#include <objects/seqalign/Seq_align.hpp>
+#include <objects/seqalign/Dense_seg.hpp>
+
+for (size_t qi = 0; qi < results->GetNumResults(); ++qi) {
+    const CSearchResults& qresult = (*results)[qi];
+
+    if (!qresult.HasAlignments()) {
+        continue;
+    }
+
+    CConstRef<CSeq_align_set> aln_set = qresult.GetSeqAlign();
+
+    for (const CRef<CSeq_align>& aln : aln_set->Get()) {
+        // Each CSeq_align represents one HSP
+
+        // Retrieve score and E-value from the score list
+        int score = 0;
+        double evalue = 0.0;
+        aln->GetNamedScore(CSeq_align::eScore_Score,    score);
+        aln->GetNamedScore(CSeq_align::eScore_EValue,   evalue);
+        aln->GetNamedScore(CSeq_align::eScore_BitScore,
+                           /* double bit_score */ evalue);
+
+        // Access alignment coordinates via the Dense-seg
+        const CDense_seg& dseg = aln->GetSegs().GetDenseg();
+        int num_segments = dseg.GetNumseg();
+        // dseg.GetStarts(), dseg.GetLens() give per-segment data
+    }
+
+    // Ancillary data: Karlin-Altschul parameters, search space
+    CRef<CBlastAncillaryData> anc = qresult.GetAncillaryData();
+    Int8 search_space = anc->GetSearchSpace();
+}
+```
+
+## Complete example: blastn search
+
+The following example runs a blastn search of a single nucleotide sequence against the `nt` database using customised options.
+
+```cpp
+#include <algo/blast/api/blast_nucl_options.hpp>
+#include <algo/blast/api/local_blast.hpp>
+#include <algo/blast/api/local_db_adapter.hpp>
+#include <algo/blast/api/sseqloc.hpp>
+#include <algo/blast/api/objmgr_query_data.hpp>
+#include <objmgr/object_manager.hpp>
+#include <objmgr/scope.hpp>
+#include <objects/seqloc/Seq_loc.hpp>
+#include <objects/seqloc/Seq_id.hpp>
+#include <objects/seqalign/Seq_align_set.hpp>
+
+USING_NCBI_SCOPE;
+USING_SCOPE(blast);
+USING_SCOPE(objects);
+
+void RunBlastn(const string& db_name, CRef<CSeq_loc> query_loc)
+{
+    // 1. Scope / object manager
+    CRef<CObjectManager> objmgr = CObjectManager::GetInstance();
+    CRef<CScope> scope(new CScope(*objmgr));
+    scope->AddDefaults();
+
+    // 2. Options: traditional blastn, strict E-value cutoff
+    CRef<CBlastNucleotideOptionsHandle> opts(
+        new CBlastNucleotideOptionsHandle);
+    opts->SetTraditionalBlastnDefaults();
+    opts->SetEvalueThreshold(1e-10);
+    opts->SetWordSize(11);
+    opts->SetDustFiltering(true);
+
+    // 3. Query
+    TSeqLocVector queries;
+    queries.push_back(SSeqLoc(query_loc, scope));
+    CRef<IQueryFactory> qf(new CObjMgr_QueryFactory(queries));
+
+    // 4. Database
+    CSearchDatabase db(db_name,
+        CSearchDatabase::eBlastDbIsNucleotide);
+
+    // 5. Search
+    CRef<CLocalBlast> blast(new CLocalBlast(qf, opts, db));
+    CRef<CSearchResultSet> results = blast->Run();
+
+    // 6. Iterate results
+    for (size_t i = 0; i < results->GetNumResults(); ++i) {
+        const CSearchResults& res = (*results)[i];
+        if (!res.HasAlignments()) continue;
+
+        CConstRef<CSeq_align_set> alns = res.GetSeqAlign();
+        for (const CRef<CSeq_align>& aln : alns->Get()) {
+            double evalue = 0.0;
+            int    score  = 0;
+            aln->GetNamedScore(CSeq_align::eScore_EValue, evalue);
+            aln->GetNamedScore(CSeq_align::eScore_Score,  score);
+
+            NcbiCout << "Score=" << score
+                     << "  E=" << evalue << NcbiEndl;
+        }
+    }
+}
+```
+
+<Note>
+`CLocalBlast` is not thread-safe by default. To search multiple queries concurrently, construct a separate `CLocalBlast` instance per thread and share the read-only `CSearchDatabase`.
+</Note>
+
+## Key parameters reference
+
+| Parameter | Handle method | Default (blastn) | Notes |
+|---|---|---|---|
+| Word size | `SetWordSize(int)` | 11 (blastn), 28 (megablast) | Seed length for initial hits |
+| E-value threshold | `SetEvalueThreshold(double)` | 10.0 | Maximum expect value to report |
+| Gap open | `SetGapOpeningCost(int)` | 5 | Affine gap open cost |
+| Gap extend | `SetGapExtensionCost(int)` | 2 | Affine gap extension cost |
+| Match reward | `SetMatchReward(int)` | 2 | Nucleotide match score |
+| Mismatch penalty | `SetMismatchPenalty(int)` | -3 | Nucleotide mismatch (negative) |
+| Hit list size | `SetHitlistSize(int)` | 500 | Max database hits per query |
+| Percent identity | `SetPercentIdentity(double)` | 0.0 (off) | Minimum % identity filter |
+| DUST filtering | `SetDustFiltering(bool)` | true | Mask low-complexity DNA |
+| Gapped mode | `SetGappedMode(bool)` | true | Enable gapped extensions |
+
+<Warning>
+Setting `SetEffectiveSearchSpace` to a non-zero value overrides the automatically computed search space, which affects E-value calculation. Only do this if you have a specific reason, such as normalising scores across different database sizes.
+</Warning>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Sequence Masking" href="/algorithms/sequence-masking">
+    Filter low-complexity regions with DUST, SEG, or WindowMasker before running BLAST
+  </Card>
+  <Card title="Sequence Alignment" href="/algorithms/sequence-alignment">
+    Pairwise and spliced alignment with CNWAligner, CBandAligner, and CSplign
+  </Card>
+</CardGroup>

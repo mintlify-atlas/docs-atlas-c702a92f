@@ -1,0 +1,331 @@
+---
+title: "HTTP Client: Sessions, Requests, and Responses"
+description: "Send GET, POST, and DELETE requests, manage cookies, configure TLS credentials, and read response streams with CHttpSession and CHttpRequest."
+---
+
+The NCBI HTTP client library (`<connect/ncbi_http_session.hpp>`) provides a session-oriented model where one `CHttpSession` object accumulates cookies, credentials, and protocol settings across multiple requests. Each `CHttpRequest` carries its own headers, form data, timeouts, and retry count, and executing it returns a `CHttpResponse` from which you can read the response status, headers, and body stream.
+
+## CHttpSession — the entry point
+
+`CHttpSession` is the primary class for HTTP/1.x communication. It derives from `CHttpSession_Base`, which holds cookies, TLS credentials, proxy settings, and the active HTTP protocol version.
+
+```cpp
+#include <connect/ncbi_http_session.hpp>
+USING_NCBI_SCOPE;
+
+CHttpSession session;
+```
+
+### Request method shortcuts
+
+`CHttpSession` provides three one-call methods that handle the full request-response cycle:
+
+| Method | Description |
+|--------|-------------|
+| `Get(url, timeout, retries)` | Send a GET request and return `CHttpResponse` |
+| `Post(url, data, content_type, timeout, retries)` | Send a POST with a raw body string |
+| `Put(url, data, content_type, timeout, retries)` | Send a PUT with a raw body string |
+
+```cpp
+CHttpResponse resp = session.Get(CUrl("https://example.ncbi.nlm.nih.gov/"));
+if (resp.GetStatusCode() == 200) {
+    string body(istreambuf_iterator<char>(resp.ContentStream()), {});
+}
+```
+
+### Protocol version
+
+```cpp
+session.SetProtocol(CHttpSession_Base::eHTTP_11); // HTTP/1.1
+session.SetProtocol(CHttpSession_Base::eHTTP_10); // HTTP/1.0 (default)
+```
+
+## Creating a request with `NewRequest()`
+
+`NewRequest()` allocates a `CHttpRequest` without yet opening a connection. You can modify headers, form data, and timeouts before calling `Execute()`.
+
+```cpp
+CHttpRequest req = session.NewRequest(
+    CUrl("https://api.example.com/search"),
+    CHttpSession_Base::eGet);
+```
+
+Supported methods: `eHead`, `eGet`, `ePost`, `ePut`, `ePatch`, `eDelete`.
+
+## Setting request headers
+
+`CHttpRequest::Headers()` returns a mutable `CHttpHeaders&`. Use `SetValue()` to replace a header or `AddValue()` to append when multiple values are allowed.
+
+```cpp
+req.Headers().SetValue(CHttpHeaders::eUserAgent, "MyCgiApp/1.0");
+req.Headers().SetValue(CHttpHeaders::eContentType, "application/json");
+req.Headers().SetValue("X-Custom-Token", "abc123");
+```
+
+Standard header names are available as `CHttpHeaders::EHeaderName` constants:
+
+| Constant | Header field |
+|----------|--------------|
+| `eCacheControl` | `Cache-Control` |
+| `eContentLength` | `Content-Length` |
+| `eContentType` | `Content-Type` |
+| `eCookie` | `Cookie` |
+| `eUserAgent` | `User-Agent` |
+| `eHost` | `Host` |
+
+<Note>
+The headers `NCBI-SID` and `NCBI-PHID` are reserved. Setting them directly throws an exception; they must be set via `CRequestContext` and are added automatically by the stream layer.
+</Note>
+
+## Basic HTTP request workflow
+
+<Steps>
+  <Step title="Create a session">
+    Instantiate `CHttpSession` (for HTTP/1.x) or `CHttp2Session` (for HTTP/2). The session object persists cookies and credentials between requests.
+
+    ```cpp
+    CHttpSession session;
+    session.SetProtocol(CHttpSession_Base::eHTTP_11);
+    ```
+  </Step>
+  <Step title="Build a request">
+    Call `session.NewRequest()` with a `CUrl` and method enum, then configure headers, form data, and timeouts before sending.
+
+    ```cpp
+    CHttpRequest req = session.NewRequest(
+        CUrl("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"),
+        CHttpSession_Base::eGet);
+    req.Headers().SetValue(CHttpHeaders::eUserAgent, "NCBIToolkit/1.0");
+    req.SetTimeout(CTimeout(10.0));   // 10-second timeout
+    req.SetRetries(3);
+    ```
+  </Step>
+  <Step title="Execute the request">
+    `CHttpRequest::Execute()` opens the connection, sends the request, and waits for the response headers. The returned `CHttpResponse` object is valid until the next `Execute()` call on the same request.
+
+    ```cpp
+    CHttpResponse resp = req.Execute();
+    ```
+  </Step>
+  <Step title="Check the response status">
+    Inspect `GetStatusCode()` and `CanGetContentStream()` before reading data. Status codes in the `2xx` range indicate success; any other range means the body is an error page accessible via `ErrorStream()`.
+
+    ```cpp
+    int code = resp.GetStatusCode();
+    if (!resp.CanGetContentStream()) {
+        cerr << "Error " << code << ": " << resp.GetStatusText() << '\n';
+        return;
+    }
+    ```
+  </Step>
+  <Step title="Read the response body">
+    `ContentStream()` returns a `CNcbiIstream&` that you can read with standard C++ stream operators. The actual data transfer occurs as you read from this stream.
+
+    ```cpp
+    CNcbiIstream& body = resp.ContentStream();
+    string line;
+    while (getline(body, line)) {
+        cout << line << '\n';
+    }
+    ```
+  </Step>
+</Steps>
+
+## Complete GET example
+
+```cpp
+#include <connect/ncbi_http_session.hpp>
+USING_NCBI_SCOPE;
+
+int FetchPubMedAbstract(int pmid)
+{
+    CHttpSession session;
+
+    CHttpRequest req = session.NewRequest(
+        CUrl("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+             "?db=pubmed&rettype=abstract&id=" + to_string(pmid)),
+        CHttpSession_Base::eGet);
+
+    req.Headers().SetValue(CHttpHeaders::eUserAgent, "MyApp/1.0 (myemail@example.com)");
+    req.SetTimeout(CTimeout(30.0));
+    req.SetRetries(2);
+
+    CHttpResponse resp = req.Execute();
+
+    if (resp.GetStatusCode() != 200) {
+        cerr << "HTTP error: " << resp.GetStatusCode()
+             << " " << resp.GetStatusText() << '\n';
+        return 1;
+    }
+
+    string body(istreambuf_iterator<char>(resp.ContentStream()),
+                istreambuf_iterator<char>());
+    cout << body;
+    return 0;
+}
+```
+
+## Complete POST example
+
+```cpp
+#include <connect/ncbi_http_session.hpp>
+USING_NCBI_SCOPE;
+
+void PostJsonData(const string& json_payload)
+{
+    CHttpSession session;
+    session.SetProtocol(CHttpSession_Base::eHTTP_11);
+
+    CHttpRequest req = session.NewRequest(
+        CUrl("https://api.example.com/submit"),
+        CHttpSession_Base::ePost);
+
+    req.Headers().SetValue(CHttpHeaders::eContentType, "application/json");
+    req.Headers().SetValue(CHttpHeaders::eUserAgent,   "NCBIToolkit/1.0");
+    req.SetTimeout(CTimeout(60.0));
+
+    // Write POST body to the content stream
+    CNcbiOstream& out = req.ContentStream();
+    out << json_payload;
+
+    CHttpResponse resp = req.Execute();
+
+    cout << "Status: " << resp.GetStatusCode()
+         << " " << resp.GetStatusText() << '\n';
+
+    if (resp.CanGetContentStream()) {
+        CNcbiIstream& body = resp.ContentStream();
+        cout << string(istreambuf_iterator<char>(body),
+                       istreambuf_iterator<char>()) << '\n';
+    }
+}
+```
+
+## CHttpResponse — reading response data
+
+| Method | Description |
+|--------|-------------|
+| `GetStatusCode()` | Integer HTTP status code (e.g., `200`, `404`) |
+| `GetStatusText()` | Reason phrase (e.g., `"OK"`, `"Not Found"`) |
+| `CanGetContentStream()` | `true` for `2xx` status codes |
+| `ContentStream()` | `CNcbiIstream&` for successful responses |
+| `ErrorStream()` | `CNcbiIstream&` for error response bodies |
+| `Headers()` | `const CHttpHeaders&` with all response headers |
+| `GetLocation()` | Final URL after any redirects |
+
+```cpp
+// Read a single response header
+const string& content_type =
+    resp.Headers().GetValue(CHttpHeaders::eContentType);
+```
+
+### Reading response body as a stream
+
+The content stream is a standard C++ input stream. You can use any idiom that works with `std::istream`:
+
+```cpp
+// Read entire body into a string
+string body(istreambuf_iterator<char>(resp.ContentStream()),
+            istreambuf_iterator<char>());
+
+// Line-by-line
+string line;
+while (getline(resp.ContentStream(), line)) {
+    process(line);
+}
+```
+
+## Timeout configuration and retry handling
+
+Timeouts are configured per-request via `CHttpRequest::SetTimeout()` and per-session via `CHttpParam`. The global environment variable `$CONN_TIMEOUT` sets a fallback value.
+
+```cpp
+req.SetTimeout(CTimeout(5.0));         // 5-second I/O timeout
+req.SetTimeout(30, 500000);            // 30.5 seconds (sec, usec form)
+req.SetRetries(5);                     // up to 5 retry attempts
+req.SetDeadline(CTimeout(120.0));      // absolute wall-clock deadline
+req.SetRetryProcessing(eOn);           // wait for real response, not just 503
+```
+
+<Tip>
+`SetRetryProcessing(eOn)` combined with `SetDeadline()` keeps the request retrying until either a non-retriable response is received or the deadline expires. This is useful when hitting NCBI services that return `503 Service Unavailable` during transient load spikes.
+</Tip>
+
+## HTTP/2 support via CHttp2Session
+
+`CHttp2Session` (`<connect/ncbi_http2_session.hpp>`) uses the same `CHttpRequest` / `CHttpResponse` API as `CHttpSession` but negotiates HTTP/2 over TLS.
+
+```cpp
+#include <connect/ncbi_http2_session.hpp>
+USING_NCBI_SCOPE;
+
+CHttp2Session session;
+
+// Optionally hold an API lock to avoid teardown/re-creation overhead
+// when using many short-lived sessions
+CHttp2Session::TApiLock lock = CHttp2Session::GetApiLock();
+
+CHttpRequest req = session.NewRequest(
+    CUrl("https://api.example.com/v2/data"),
+    CHttpSession_Base::eGet);
+
+CHttpResponse resp = req.Execute();
+cout << resp.GetStatusCode() << '\n';
+```
+
+<Note>
+`CHttp2Session` requires the build to include the HTTP/2 support library (`libconnect2`). It automatically downgrades to HTTP/1.1 when the server does not advertise HTTP/2 in its ALPN extension.
+</Note>
+
+## TLS/SSL connections
+
+HTTPS URLs are handled transparently when the NCBI TLS layer is initialized. For mutual TLS, supply a `CTlsCertCredentials` object:
+
+```cpp
+#include <connect/ncbi_http_session.hpp>
+USING_NCBI_SCOPE;
+
+// Load certificate and private key from PEM strings
+auto creds = make_shared<CTlsCertCredentials>(cert_pem, pkey_pem);
+
+CHttpSession session;
+session.SetCredentials(creds);  // apply to all requests in this session
+
+// Or per-request:
+CHttpRequest req = session.NewRequest(CUrl("https://secure.example.com/"),
+                                      CHttpSession_Base::eGet);
+// credentials inherited from session, or set individually:
+// req.SetParam(CHttpParam().SetCredentials(creds));
+CHttpResponse resp = req.Execute();
+```
+
+## Proxy configuration
+
+```cpp
+// Session-level proxy
+session.SetProxy(CHttpProxy("proxy.corp.example.com", 8080));
+
+// Per-request proxy (overrides session-level)
+req.SetProxy(CHttpProxy("proxy.corp.example.com", 8080, "user", "pass"));
+```
+
+## Global shortcut functions
+
+For one-off requests where cookie sharing is not needed, use the `g_Http*` free functions:
+
+```cpp
+// Simple GET with default timeout
+CHttpResponse r1 = g_HttpGet(CUrl("https://example.com/"));
+
+// GET with custom timeout and retry count
+CHttpResponse r2 = g_HttpGet(CUrl("https://example.com/"), CTimeout(10.0), 2);
+
+// POST with body
+CHttpResponse r3 = g_HttpPost(CUrl("https://example.com/api"),
+                               "key=value",
+                               "application/x-www-form-urlencoded");
+```
+
+<Warning>
+Each `g_Http*` call creates an independent session. Cookies set by one call are not visible to subsequent calls. Use `CHttpSession` directly when you need persistent cookies or shared credentials.
+</Warning>

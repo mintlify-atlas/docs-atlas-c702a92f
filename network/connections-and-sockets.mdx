@@ -1,0 +1,306 @@
+---
+title: "TCP Sockets, I/O Streams, and Named Pipes"
+description: "Build reliable network connections in C++ using CSocket, CListeningSocket, CConn_IOStream, and CNamedPipe from the NCBI connect library."
+---
+
+The NCBI connect library provides a layered networking stack that spans raw TCP sockets (`CSocket`, `CListeningSocket`), C++ iostream wrappers (`CConn_IOStream`, `CConn_SocketStream`), multiplexed I/O polling via `CSocketAPI::Poll()`, and interprocess named pipes (`CNamedPipe`). All classes share a common `EIO_Status` return convention and a flexible `STimeout` mechanism so that blocking behavior can be tuned at any level of the stack.
+
+## CSocket — client-side TCP connection
+
+`CSocket` wraps the underlying C `SOCK` handle and adds RAII ownership, C++ string overloads, and per-direction timeout objects. All timeouts start as infinite; each direction — open, read, write, close — carries its own `STimeout*`.
+
+### Key methods
+
+| Method | Description |
+|--------|-------------|
+| `Connect(host, port, timeout, flags)` | Open (or re-open) a TCP connection |
+| `Read(buf, size, n_read, how)` | Read bytes; `how` is `eIO_ReadPlain` or `eIO_ReadPersist` |
+| `Write(buf, size, n_written, how)` | Write bytes; `how` is `eIO_WritePlain` or `eIO_WritePersist` |
+| `ReadLine(str)` | Read a CR-LF / LF / null-terminated line into a `string` |
+| `Pushback(buf, size)` | Return data to the socket's internal read buffer |
+| `Close()` | Flush and close; only acts when the socket is owned |
+| `Abort()` | Immediately drop the connection without flushing |
+| `GetStatus(direction)` | Return `EIO_Status` for last I/O in the given direction |
+| `SetTimeout(event, timeout)` | Set timeout for `eIO_Open/Read/Write/Close` |
+| `Wait(event, timeout)` | Block until a single socket is ready for I/O |
+| `Shutdown(how)` | Half-close in the specified direction |
+
+### Timeouts — `STimeout` and `SetTimeout()`
+
+`STimeout` is a plain struct `{ unsigned int sec; unsigned int usec; }`. Pass `kInfiniteTimeout` to wait forever or a zeroed struct to poll without blocking. The special sentinel `kDefaultTimeout` leaves the previously set value unchanged.
+
+```cpp
+STimeout t = {5, 0};   // 5-second timeout
+sock.SetTimeout(eIO_Read,  &t);
+sock.SetTimeout(eIO_Write, &t);
+```
+
+<Note>
+`eIO_ReadPersist` and `eIO_WritePersist` retry internally until the full buffer is transferred or an error occurs. Check `n_read`/`n_written` even when the return code is not `eIO_Success`; some bytes may have been transferred before the error.
+</Note>
+
+## CListeningSocket — server-side accepting
+
+`CListeningSocket` binds a port and accepts incoming `CSocket` objects. It derives from `CPollable`, so it can be included in `CSocketAPI::Poll()` arrays alongside data sockets.
+
+| Method | Description |
+|--------|-------------|
+| `Listen(port, backlog, flags, ipv6)` | Bind and listen; pass `0` for `port` to pick an ephemeral port |
+| `Accept(sock, timeout, flags)` | Block until a client connects; fills an owned `CSocket*` or `CSocket&` |
+| `GetPort()` | Return the port number in host byte order |
+| `GetStatus()` | `eIO_Success` if bound, `eIO_Closed` if not yet bound or closed |
+| `Close()` | Stop accepting; does not affect already-accepted sockets |
+
+## TCP code examples
+
+<Tabs>
+  <Tab title="TCP Client">
+```cpp
+#include <connect/ncbi_socket.hpp>
+USING_NCBI_SCOPE;
+
+int main()
+{
+    // Connect with a 10-second open timeout
+    STimeout conn_timeout = {10, 0};
+    CSocket sock("example.ncbi.nlm.nih.gov", 80, &conn_timeout);
+
+    if (sock.GetStatus(eIO_Open) != eIO_Success) {
+        cerr << "Connection failed\n";
+        return 1;
+    }
+
+    // Set read/write timeouts to 30 seconds
+    STimeout rw_timeout = {30, 0};
+    sock.SetTimeout(eIO_ReadWrite, &rw_timeout);
+
+    // Write an HTTP GET request
+    const string request =
+        "GET / HTTP/1.0\r\nHost: example.ncbi.nlm.nih.gov\r\n\r\n";
+    size_t n_written = 0;
+    EIO_Status st = sock.Write(request.data(), request.size(),
+                               &n_written, eIO_WritePersist);
+    if (st != eIO_Success) {
+        cerr << "Write failed\n";
+        return 1;
+    }
+
+    // Read the response line-by-line
+    string line;
+    while (sock.ReadLine(line) == eIO_Success) {
+        cout << line << '\n';
+        if (line.empty()) break;  // blank line ends headers
+    }
+
+    sock.Close();
+    return 0;
+}
+```
+  </Tab>
+  <Tab title="TCP Server">
+```cpp
+#include <connect/ncbi_socket.hpp>
+USING_NCBI_SCOPE;
+
+int main()
+{
+    // Bind to port 12345, backlog 10
+    CListeningSocket lsock(12345, 10);
+    if (lsock.GetStatus() != eIO_Success) {
+        cerr << "Listen failed\n";
+        return 1;
+    }
+    cout << "Listening on port " << lsock.GetPort() << '\n';
+
+    for (;;) {
+        CSocket* client = nullptr;
+        EIO_Status st = lsock.Accept(client, kInfiniteTimeout);
+        if (st != eIO_Success || !client) continue;
+
+        // Echo server: read one line, write it back
+        string line;
+        client->ReadLine(line);
+        line += "\r\n";
+        client->Write(line.data(), line.size(), nullptr, eIO_WritePersist);
+        client->Close();
+        delete client;
+    }
+}
+```
+  </Tab>
+</Tabs>
+
+## CSocketAPI — polling and global settings
+
+`CSocketAPI` is a collection of static methods that operate across multiple sockets or configure API-wide defaults.
+
+### `CSocketAPI::Poll()` — waiting on multiple sockets
+
+`Poll()` takes a `vector<SPoll>` where each element names a `CPollable*` and the events of interest (`eIO_Read`, `eIO_Write`, or `eIO_ReadWrite`). On return, each element's `m_REvent` field is set to the events that became ready.
+
+```cpp
+#include <connect/ncbi_socket.hpp>
+USING_NCBI_SCOPE;
+
+void poll_two_sockets(CSocket& s1, CSocket& s2)
+{
+    vector<CSocketAPI::SPoll> polls = {
+        {&s1, eIO_Read},
+        {&s2, eIO_Read}
+    };
+
+    STimeout timeout = {5, 0};
+    size_t n_ready = 0;
+    EIO_Status st = CSocketAPI::Poll(polls, &timeout, &n_ready);
+
+    if (st == eIO_Success) {
+        for (auto& p : polls) {
+            if (p.m_REvent == eIO_Read) {
+                // This socket has data available
+            }
+        }
+    }
+}
+```
+
+<Tip>
+For performance with many sockets, prefer the lower-level C function `SOCK_Poll()` (passing `vector::data()` and `vector::size()`) to avoid the overhead of `std::vector` iteration inside the C++ wrapper.
+</Tip>
+
+### Global defaults
+
+```cpp
+// Suppress SIGPIPE on UNIX (call before any socket use)
+CSocketAPI::AllowSigPipe();
+
+// Enable both IPv4 and IPv6 (default)
+CSocketAPI::SetIPv6(eDefault);
+
+// Set API-wide read-on-write and interrupt-on-signal behavior
+CSocketAPI::SetReadOnWrite(eOn);
+CSocketAPI::SetInterruptOnSignal(eOff);
+```
+
+## CConn_IOStream — C++ iostream over NCBI connections
+
+`CConn_IOStream` is the base class for all NCBI connection-backed streams. It inherits from `std::iostream`, so standard `<<` / `>>` operators work directly. The stream owns a `CConn_Streambuf` that handles buffering between the user-visible stream and the underlying `CONN` handle.
+
+### Important methods
+
+| Method | Description |
+|--------|-------------|
+| `SetTimeout(direction, timeout)` | Set I/O timeout on the underlying CONN |
+| `GetTimeout(direction)` | Retrieve the current timeout |
+| `Status(direction)` | Last `EIO_Status` from the underlying connector |
+| `Fetch(timeout)` | Flush output and wait for the server response header |
+| `GetSOCK()` | Retrieve the underlying `SOCK` handle (after `Fetch()`) |
+| `GetSocket()` | Return a `CSocket&` wrapping the underlying SOCK |
+| `Close()` | Flush, close, and invalidate the stream |
+| `Pushback(data, size)` | Push unread data back into the CONN |
+| `SetCanceledCallback(canceled)` | Install a cancellation callback |
+
+The `fConn_Untie` flag (passed in the constructor) decouples the input and output directions so that reads do not automatically flush pending output first.
+
+## CConn_SocketStream — stream over a TCP socket
+
+`CConn_SocketStream` extends `CConn_IOStream` with constructors that create a socket connection directly from a host/port pair, an existing `SOCK` or `CSocket`, or an `SConnNetInfo` proxy tunnel specification.
+
+```cpp
+#include <connect/ncbi_conn_stream.hpp>
+USING_NCBI_SCOPE;
+
+void download_page(const string& host, unsigned short port)
+{
+    // 3 connection attempts, default I/O timeout
+    CConn_SocketStream ss(host, port, /*max_try=*/3);
+
+    ss << "GET / HTTP/1.0\r\nHost: " << host << "\r\n\r\n";
+    ss.flush();
+
+    string line;
+    while (getline(ss, line)) {
+        cout << line << '\n';
+    }
+}
+```
+
+<Note>
+When building a stream on top of an existing `CSocket`, ownership of the underlying `SOCK` is transferred to the stream — the original `CSocket` is left empty. Pass `eNoOwnership` to the `SOCK`-based constructor variant to retain ownership.
+</Note>
+
+### NCBI_CONN_STREAM macros and CConn_StreamConnector
+
+Low-level code can also create CONN-backed streams via `SOCK_CreateConnector` or `SOCK_CreateConnectorOnTop` from `<connect/ncbi_socket_connector.h>`, then wrap the result in `CConn_IOStream(connector, ...)`. The `NcbiOpenURL()` free function provides a shortcut that infers the stream type from a URL scheme (`file://`, `http://`, `https://`, `ftp://`, or a bare NCBI service name).
+
+```cpp
+// Open any supported URL for reading
+unique_ptr<CConn_IOStream> stream(NcbiOpenURL("https://example.com/data.txt"));
+string content(istreambuf_iterator<char>(*stream), {});
+```
+
+## Non-blocking I/O patterns
+
+`CSocket::Wait()` blocks on a single socket; `CSocketAPI::Poll()` blocks on many. A zero-valued `STimeout` (`{0, 0}`) turns either into a non-blocking poll.
+
+```cpp
+// Non-blocking check: is data available right now?
+STimeout zero = {0, 0};
+EIO_Status st = sock.Wait(eIO_Read, &zero);
+if (st == eIO_Success) {
+    // Data is available immediately
+} else if (st == eIO_Timeout) {
+    // Nothing yet
+}
+```
+
+## Named pipes — CNamedPipe, CNamedPipeClient, CNamedPipeServer
+
+Named pipes provide synchronous interprocess communication on the same machine (or over the network on Windows). All three classes share `Read()`, `Write()`, `Close()`, and `SetTimeout()` methods.
+
+<CardGroup cols={2}>
+  <Card title="CNamedPipeClient" icon="arrow-right">
+    Connect to a server-side named pipe by name. Call `Open(pipename, timeout, pipesize)` or pass the name in the constructor.
+  </Card>
+  <Card title="CNamedPipeServer" icon="server">
+    Bind a named pipe and wait for clients. Call `Create(pipename, timeout, pipesize)`, then loop on `Listen()` and `Disconnect()`.
+  </Card>
+</CardGroup>
+
+```cpp
+#include <connect/ncbi_namedpipe.hpp>
+USING_NCBI_SCOPE;
+
+// Server side
+CNamedPipeServer server;
+server.Create("my_pipe", kInfiniteTimeout, 4096);
+server.Listen(); // block until client connects
+
+char buf[256];
+size_t n_read = 0;
+server.Read(buf, sizeof(buf), &n_read);
+server.Write("OK\n", 3);
+server.Disconnect();
+server.Close();
+
+// Client side
+CNamedPipeClient client;
+client.Open("my_pipe", kInfiniteTimeout, 4096);
+client.Write("Hello\n", 6);
+client.Read(buf, sizeof(buf), &n_read);
+client.Close();
+```
+
+`CConn_NamedPipeStream` wraps a named pipe in a `CConn_IOStream` for standard iostream access:
+
+```cpp
+#include <connect/ncbi_conn_stream.hpp>
+USING_NCBI_SCOPE;
+
+CConn_NamedPipeStream ns("my_pipe", /*pipesize=*/0);
+ns << "Hello from iostream\n";
+ns.flush();
+```
+
+<Warning>
+On Windows, the pipe name must follow the UNC form `\\.\pipe\name`. On UNIX, it is a filesystem path; `CNamedPipe` will prepend `/tmp/` if only a bare filename is supplied.
+</Warning>

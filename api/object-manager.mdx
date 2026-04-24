@@ -1,0 +1,391 @@
+---
+title: "NCBI Object Manager: Scope, Bioseq, and Feature APIs"
+description: "Reference for CObjectManager, CScope, CBioseq_Handle, CSeqVector, CFeat_CI, and CMappedFeat — the core classes of the NCBI Object Manager library."
+---
+
+The NCBI Object Manager (`objmgr`) library provides a unified, cache-aware interface for accessing biological sequence data. A single `CObjectManager` singleton coordinates data loaders; individual `CScope` objects provide the context for sequence lookup and feature iteration. Understanding the relationship between these classes is the starting point for any sequence-analysis application.
+
+---
+
+## CObjectManager
+
+`CObjectManager` is a process-wide singleton that registers data loaders and supplies them to `CScope` instances on demand. Obtain it with `GetInstance()`; never construct it directly.
+
+```cpp
+#include <objmgr/object_manager.hpp>
+
+CRef<CObjectManager> om = CObjectManager::GetInstance();
+```
+
+### GetInstance()
+
+```cpp
+static CRef<CObjectManager> GetInstance(void);
+```
+
+Returns (or lazily creates) the global `CObjectManager`. Thread-safe.
+
+<ResponseField name="return" type="CRef<CObjectManager>">
+Reference to the singleton instance.
+</ResponseField>
+
+### RegisterInObjectManager()
+
+Data loaders provide a static `RegisterInObjectManager()` factory method that registers the loader with the object manager. The signature varies by loader type, but the general pattern is:
+
+```cpp
+// Example: GenBank loader
+#include <objtools/data_loaders/genbank/gbloader.hpp>
+
+CGBDataLoader::RegisterInObjectManager(*om,
+    CGBDataLoader::eDefault);
+```
+
+The method returns `SRegisterLoaderInfo<TLoader>`, a struct with:
+
+<ResponseField name="GetLoader()" type="TLoader*">
+Pointer to the (possibly pre-existing) loader instance, or `nullptr` on failure.
+</ResponseField>
+<ResponseField name="IsCreated()" type="bool">
+`true` if the loader was freshly created; `false` if it was already registered.
+</ResponseField>
+
+### RevokeDataLoader()
+
+```cpp
+bool RevokeDataLoader(CDataLoader& loader);
+bool RevokeDataLoader(const string& loader_name);
+```
+
+Unregisters a data loader. Returns `false` if the loader is still held by an active scope. Throws if the loader is not registered.
+
+<ParamField path="loader" type="CDataLoader&" required>
+Reference to the loader to revoke.
+</ParamField>
+
+<ResponseField name="return" type="bool">
+`true` on success; `false` if the loader is still in use.
+</ResponseField>
+
+---
+
+## CScope
+
+`CScope` defines the visibility context for sequence resolution. Create one per thread or per logical task; multiple scopes can coexist.
+
+```cpp
+#include <objmgr/scope.hpp>
+
+CRef<CObjectManager> om = CObjectManager::GetInstance();
+CScope scope(*om);
+scope.AddDefaults();   // add all default-registered loaders
+```
+
+### Constructor
+
+```cpp
+explicit CScope(CObjectManager& objmgr);
+```
+
+<ParamField path="objmgr" type="CObjectManager&" required>
+The object manager that owns the data loaders visible to this scope.
+</ParamField>
+
+### AddDefaults()
+
+```cpp
+void AddDefaults(TPriority pri = kPriority_Default);
+```
+
+Adds all data loaders registered with `EIsDefault::eDefault` to this scope.
+
+<ParamField path="pri" type="TPriority">
+Override the loader priorities. Pass `kPriority_Default` (-1) to use each loader's registered default.
+</ParamField>
+
+### AddTopLevelSeqEntry()
+
+```cpp
+CSeq_entry_Handle AddTopLevelSeqEntry(
+    CSeq_entry& top_entry,
+    TPriority   pri    = kPriority_Default,
+    EExist      action = eExist_Default
+);
+// Const (read-only) overload:
+CSeq_entry_Handle AddTopLevelSeqEntry(
+    const CSeq_entry& top_entry,
+    TPriority         pri    = kPriority_Default,
+    EExist            action = eExist_Throw
+);
+```
+
+Adds an in-memory `CSeq_entry` to the scope. This is the standard way to work with locally constructed sequence data.
+
+<ParamField path="top_entry" type="CSeq_entry&" required>
+Top-level sequence entry to register.
+</ParamField>
+<ParamField path="pri" type="TPriority">
+Search priority (lower numbers searched first). Default is `kPriority_Entry` (9).
+</ParamField>
+<ParamField path="action" type="EExist">
+Behaviour if the entry is already registered: `eExist_Throw` (default) or `eExist_Get`.
+</ParamField>
+
+<ResponseField name="return" type="CSeq_entry_Handle">
+Handle to the registered entry.
+</ResponseField>
+
+### GetBioseqHandle()
+
+```cpp
+CBioseq_Handle GetBioseqHandle(const CSeq_id& id);
+CBioseq_Handle GetBioseqHandle(const CSeq_id_Handle& id);
+CBioseq_Handle GetBioseqHandle(const CSeq_loc& loc);
+```
+
+Looks up a sequence by identifier, loading it through registered data loaders if necessary.
+
+<ParamField path="id" type="const CSeq_id&" required>
+Sequence identifier to resolve.
+</ParamField>
+
+<ResponseField name="return" type="CBioseq_Handle">
+Valid handle if found; empty (evaluates to `false`) if not found.
+</ResponseField>
+
+### AddBioseq()
+
+```cpp
+CBioseq_Handle AddBioseq(
+    CBioseq&  bioseq,
+    TPriority pri    = kPriority_Default,
+    EExist    action = eExist_Throw
+);
+```
+
+Adds an individual `CBioseq` object directly to the scope.
+
+---
+
+## CBioseq_Handle
+
+`CBioseq_Handle` is a lightweight, copy-safe proxy to a bioseq managed by the object manager. It is always obtained from `CScope`.
+
+```cpp
+CBioseq_Handle bh = scope.GetBioseqHandle(seq_id);
+if (bh) {
+    cout << "Length: " << bh.GetBioseqLength() << "\n";
+}
+```
+
+### GetSeqId()
+
+```cpp
+CConstRef<CSeq_id> GetSeqId(void) const;
+```
+
+Returns a canonical identifier for the bioseq. Throws if none is available.
+
+### GetSeqVector()
+
+```cpp
+CSeqVector GetSeqVector(
+    EVectorCoding coding,
+    ENa_strand    strand = eNa_strand_plus
+) const;
+CSeqVector GetSeqVector(
+    ENa_strand strand = eNa_strand_plus
+) const;
+```
+
+<ParamField path="coding" type="EVectorCoding">
+`eCoding_Iupac` for human-readable IUPAC codes; `eCoding_Ncbi` for binary NCBI4na/Ncbistdaa; `eCoding_NotSet` to use the native coding.
+</ParamField>
+<ParamField path="strand" type="ENa_strand">
+`eNa_strand_plus` (default) or `eNa_strand_minus`.
+</ParamField>
+
+<ResponseField name="return" type="CSeqVector">
+Sequence vector that supports random-access and iterator-based access.
+</ResponseField>
+
+### GetCompleteBioseq()
+
+```cpp
+CConstRef<CBioseq> GetCompleteBioseq(void) const;
+```
+
+Retrieves the fully populated `CBioseq` object, triggering data loading if needed.
+
+### GetBioseqLength()
+
+```cpp
+TSeqPos GetBioseqLength(void) const;
+```
+
+Returns the sequence length in residues. Calculates the length from the sequence map if it is not directly stored.
+
+### IsNucleotide() / IsProtein()
+
+```cpp
+bool IsNucleotide(void) const;
+bool IsProtein(void)    const;
+```
+
+Convenience wrappers around `GetSequenceType()` / `CSeq_inst::IsNa()`.
+
+---
+
+## CSeqVector
+
+`CSeqVector` provides element-by-element and iterator-based access to residue data. Obtain it from `CBioseq_Handle::GetSeqVector()`.
+
+```cpp
+CSeqVector sv = bh.GetSeqVector(CBioseq_Handle::eCoding_Iupac);
+string seq_str;
+sv.GetSeqData(0, sv.size(), seq_str);
+cout << seq_str << "\n";
+```
+
+### operator[]()
+
+```cpp
+TResidue operator[](TSeqPos pos) const;
+```
+
+Returns a single residue at position `pos` (0-based). The return type `TResidue` is `char` for nucleotides in IUPAC coding.
+
+### begin() / end()
+
+```cpp
+const_iterator begin(void) const;
+const_iterator end(void)   const;
+```
+
+STL-compatible iterators over the residues. Supports range-based for loops.
+
+### GetSeqData()
+
+```cpp
+void GetSeqData(TSeqPos       start,
+                TSeqPos       stop,
+                string&       buffer) const;
+```
+
+Copies residues from `[start, stop)` into `buffer`. More efficient than repeated `operator[]` calls.
+
+<ParamField path="start" type="TSeqPos" required>
+0-based start position (inclusive).
+</ParamField>
+<ParamField path="stop" type="TSeqPos" required>
+0-based stop position (exclusive).
+</ParamField>
+<ParamField path="buffer" type="string&" required>
+Destination string; will be resized to `stop - start`.
+</ParamField>
+
+### size()
+
+```cpp
+TSeqPos size(void) const;
+```
+
+Returns the number of residues in the vector.
+
+---
+
+## CFeat_CI — Feature Iterator
+
+`CFeat_CI` iterates over sequence features within a given scope and location. It resolves annotation references across data loaders automatically.
+
+```cpp
+#include <objmgr/feat_ci.hpp>
+#include <objmgr/util/feature.hpp>
+
+SAnnotSelector sel;
+sel.SetFeatType(CSeqFeatData::e_Gene);
+
+for (CFeat_CI it(scope, *seq_loc, sel); it; ++it) {
+    const CMappedFeat& mf = *it;
+    cout << mf.GetLocation().GetTotalRange() << "\n";
+}
+```
+
+### Constructors
+
+```cpp
+// Iterate over all features on a bioseq
+CFeat_CI(const CBioseq_Handle& bioseq,
+         const SAnnotSelector& sel = SAnnotSelector());
+
+// Iterate over features within a seq-loc
+CFeat_CI(CScope&               scope,
+         const CSeq_loc&       loc,
+         const SAnnotSelector& sel = SAnnotSelector());
+
+// Iterate within a seq-entry
+CFeat_CI(const CSeq_entry_Handle& entry,
+         const SAnnotSelector&    sel = SAnnotSelector());
+```
+
+### Iterator usage
+
+```cpp
+for (CFeat_CI it(bh); it; ++it) { /* *it is CMappedFeat */ }
+++it;        // advance
+it.GetSize() // total features (if pre-fetched)
+```
+
+### GetMappedFeat()
+
+```cpp
+const CMappedFeat& GetMappedFeat(void) const;
+```
+
+Returns the current feature mapped to the query location. Equivalent to `operator*()`.
+
+### GetOriginalFeature()
+
+```cpp
+const CSeq_feat& GetOriginalFeature(void) const;
+```
+
+Returns the underlying `CSeq_feat` object without location mapping.
+
+---
+
+## CMappedFeat
+
+`CMappedFeat` wraps a `CSeq_feat` and exposes its location mapped onto the query coordinate system.
+
+### GetFeatType()
+
+```cpp
+CSeqFeatData::E_Choice GetFeatType(void) const;
+```
+
+Returns the feature type (e.g. `CSeqFeatData::e_Gene`, `CSeqFeatData::e_Cdregion`).
+
+### GetFeatSubtype()
+
+```cpp
+CSeqFeatData::ESubtype GetFeatSubtype(void) const;
+```
+
+Returns a fine-grained subtype (e.g. `CSeqFeatData::eSubtype_mRNA`).
+
+### GetLocation()
+
+```cpp
+const CSeq_loc& GetLocation(void) const;
+```
+
+Returns the **mapped** location on the query sequence.
+
+### GetProduct()
+
+```cpp
+const CSeq_loc& GetProduct(void) const;
+```
+
+Returns the product location (e.g. the protein sequence for a CDS feature). Throws if no product is set.

@@ -1,0 +1,313 @@
+---
+title: "Sequence Alignment Algorithms in the NCBI C++ Toolkit"
+description: "Pairwise and multiple sequence alignment using CNWAligner, CBandAligner, CSplign, and CMultiAligner (COBALT) — global, local, and spliced alignment."
+---
+
+The NCBI C++ Toolkit provides a layered set of alignment algorithms ranging from classic dynamic-programming pairwise methods to compartment-aware spliced alignment for cDNA-to-genome mapping and constraint-guided multiple sequence alignment. All alignment headers live under `include/algo/align/` and `include/algo/cobalt/`.
+
+## Pairwise alignment overview
+
+The toolkit's pairwise alignment classes share a common design: construct the aligner with raw sequences or `CSeq_loc` objects, configure scoring parameters, call `Run()`, and retrieve the result as a `CDense_seg` or `CSeq_align`.
+
+```
+CNWAligner          Base class — global NW or local SW
+  └─ CBandAligner   Banded global alignment (≤K differences)
+  └─ CSplicedAligner Splice-aware alignment (base for CSplign)
+```
+
+## Global alignment: CNWAligner (Needleman-Wunsch)
+
+`CNWAligner` implements the Needleman-Wunsch global alignment algorithm with an affine gap penalty model. It can also run Smith-Waterman local alignment when `SetSmithWaterman(true)` is called.
+
+<Tabs>
+  <Tab title="Global alignment (NW)">
+    ```cpp
+    #include <algo/align/nw/nw_aligner.hpp>
+    #include <util/tables/raw_scoremat.h>
+
+    USING_NCBI_SCOPE;
+
+    // Nucleotide sequences in IUPAC-NA encoding
+    string seq1 = "AGCTTAGCTAGCTAGCTAGC";
+    string seq2 = "AGCTTGGCTAGCTAGCTAGC";
+
+    CNWAligner aligner(seq1, seq2);   // null scoremat → IUPAC-NA
+
+    // Scoring: match=+1, mismatch=-2, gap open=-5, gap extend=-2
+    aligner.SetWm(1);    // match reward
+    aligner.SetWms(-2);  // mismatch penalty
+    aligner.SetWg(-5);   // gap opening
+    aligner.SetWs(-2);   // gap extension
+
+    CNWAligner::TScore score = aligner.Run();
+
+    // Retrieve alignment transcript (CIGAR-like)
+    string transcript = aligner.GetTranscriptString();
+
+    // Build a Dense-seg (0-based coordinates)
+    CRef<CDense_seg> dseg = aligner.GetDense_seg(
+        0,                          // query start
+        eNa_strand_plus,
+        0,                          // subject start
+        eNa_strand_plus,
+        true);                      // trim trailing end gaps
+    ```
+
+    For protein sequences, pass an `SNCBIPackedScoreMatrix` (e.g., `NCBISM_Blosum62`):
+
+    ```cpp
+    #include <util/tables/raw_scoremat.h>
+
+    CNWAligner prot_aligner(
+        seq1.c_str(), seq1.size(),
+        seq2.c_str(), seq2.size(),
+        &NCBISM_Blosum62);
+
+    prot_aligner.SetWg(-11);   // BLOSUM62 gap open
+    prot_aligner.SetWs(-1);    // BLOSUM62 gap extend
+    prot_aligner.Run();
+    ```
+  </Tab>
+
+  <Tab title="Local alignment (SW)">
+    Smith-Waterman local alignment reuses `CNWAligner` with a flag. Only the ungapped version is implemented at this level; use BLAST for full gapped local alignment at database scale.
+
+    ```cpp
+    #include <algo/align/nw/nw_aligner.hpp>
+
+    CNWAligner aligner(seq1, seq2);
+    aligner.SetSmithWaterman(true);  // switch to SW mode
+
+    aligner.SetWm(2);
+    aligner.SetWms(-3);
+    aligner.SetWg(-5);
+    aligner.SetWs(-2);
+
+    CNWAligner::TScore score = aligner.Run();
+
+    // Find the longest aligned segment
+    size_t q0, q1, s0, s1;
+    size_t len = aligner.GetLongestSeg(&q0, &q1, &s0, &s1);
+    ```
+
+    <Note>
+    `SetSmithWaterman` and `SetGapPreference` are only implemented in `CNWAligner` itself; the derived `CBandAligner` and spliced aligners do not inherit them.
+    </Note>
+  </Tab>
+</Tabs>
+
+### Alignment via CSeq_loc (object-manager integration)
+
+`CNWAligner` can fetch sequences directly from the object manager and return a `CSeq_align`:
+
+```cpp
+#include <algo/align/nw/nw_aligner.hpp>
+#include <objmgr/scope.hpp>
+#include <objects/seqloc/Seq_id.hpp>
+
+CRef<CObjectManager> objmgr = CObjectManager::GetInstance();
+CRef<CScope> scope(new CScope(*objmgr));
+scope->AddDefaults();
+
+CSeq_id id1("NM_001234.5");
+CSeq_id id2("NM_001234.6");
+
+CNWAligner aligner;
+aligner.SetWg(-5);
+aligner.SetWs(-2);
+
+CRef<CSeq_align> aln = aligner.Run(*scope, id1, id2,
+                                    /*trim_end_gaps=*/true);
+```
+
+## Banded alignment: CBandAligner
+
+`CBandAligner` restricts the dynamic programming matrix to a diagonal band of width `2*band + 1`, reducing runtime from O(mn) to O(n·band) for sequences that differ by at most `band` edits. It derives from `CNWAligner` and inherits all scoring setters.
+
+```cpp
+#include <algo/align/nw/nw_band_aligner.hpp>
+
+USING_NCBI_SCOPE;
+
+// Allow at most 50 indels between the two sequences
+size_t max_indels = 50;
+
+CBandAligner band_aligner(
+    seq1.c_str(), seq1.size(),
+    seq2.c_str(), seq2.size(),
+    nullptr,         // IUPACna — no scoremat needed
+    max_indels);     // band half-width
+
+band_aligner.SetWm(1);
+band_aligner.SetWms(-2);
+band_aligner.SetWg(-5);
+band_aligner.SetWs(-2);
+
+CBandAligner::TScore score = band_aligner.Run();
+```
+
+Use `SetShift(where, offset)` to shift the band diagonally when the sequences are known to be offset from each other (e.g., one has an N-terminal extension).
+
+<Tip>
+For sequences expected to be nearly identical — such as two alleles or a PCR amplicon vs. a reference — banded alignment is substantially faster than full NW and should be preferred.
+</Tip>
+
+## Spliced alignment: CSplign
+
+`CSplign` aligns cDNA or EST sequences to a genomic sequence while modelling introns. It handles poly-A detection, end-gap detection, and multiple compartments. Internally it uses a `CSplicedAligner` (derived from `CNWAligner`) and produces `SAlignedCompartment` result objects.
+
+```cpp
+#include <algo/align/splign/splign.hpp>
+#include <algo/align/splign/splign_simple.hpp>
+#include <algo/align/util/blast_tabular.hpp>
+
+USING_NCBI_SCOPE;
+
+// Create and configure
+CSplign splign;
+splign.SetScope().Reset(new CScope(*CObjectManager::GetInstance()));
+splign.GetScope()->AddDefaults();
+
+// mRNA scoring preset (higher penalties for EST use eEstScoring)
+splign.SetScoringType(CSplign::eMrnaScoring);
+splign.SetMinExonIdentity(0.75);
+splign.SetMaxIntron(1200000);          // 1.2 Mb maximum intron
+splign.SetPolyaDetection(true);
+splign.SetEndGapDetection(true);
+
+// Provide pre-computed BLAST tabular hits (THitRefs)
+CSplign::THitRefs hitrefs;
+// ... populate hitrefs from BLAST output ...
+
+splign.Run(&hitrefs);
+
+// Retrieve per-compartment results
+const CSplign::TResults& comps = splign.GetResult();
+for (const auto& comp : comps) {
+    if (comp.m_Status != CSplign::SAlignedCompartment::eStatus_Ok)
+        continue;
+    double identity = comp.GetIdentity();
+    // comp.m_Segments contains per-exon alignment segments
+}
+```
+
+<Warning>
+`CSplign::Run` expects BLAST tabular hits pre-sorted by query and subject identifier. Use `CCompartmentAccessor` (from `include/algo/align/util/compartment_finder.hpp`) to group raw BLAST hits into compartments before passing them to `CSplign`.
+</Warning>
+
+### Compartment-aware alignment workflow
+
+<Steps>
+  <Step title="Run BLAST to generate hits">
+    Use `CLocalBlast` with `eMegablast` or `eBlastn` (word size 11) to produce an initial set of local alignments between the cDNA and the genome.
+  </Step>
+  <Step title="Group hits into compartments">
+    Instantiate `CCompartmentAccessor` with the raw hits and call its iteration methods to retrieve `CSplign::THitRefs` per compartment.
+  </Step>
+  <Step title="Align each compartment with CSplign">
+    Pass the per-compartment hit list to `CSplign::Run()` or to `CSplign::AlignSingleCompartment()` for fine-grained control.
+  </Step>
+  <Step title="Retrieve and serialise results">
+    Iterate `CSplign::GetResult()`. Each `SAlignedCompartment` can be converted to a `CSeq_align` for downstream ASN.1 serialisation.
+  </Step>
+</Steps>
+
+## Multiple sequence alignment: CMultiAligner (COBALT)
+
+COBALT (COnstraint Based ALignment Tool) aligns multiple protein sequences using domain hits, local BLAST hits, and progressive alignment guided by a neighbour-joining tree. The main class is `CMultiAligner` from `include/algo/cobalt/cobalt.hpp`.
+
+```cpp
+#include <algo/cobalt/cobalt.hpp>
+#include <algo/cobalt/options.hpp>
+#include <objects/seqloc/Seq_loc.hpp>
+
+USING_NCBI_SCOPE;
+USING_SCOPE(cobalt);
+USING_SCOPE(objects);
+
+// Build option set (CDD database path, iteration options, etc.)
+CRef<CMultiAlignerOptions> opts(new CMultiAlignerOptions);
+opts->SetRpsDb("CDD/Cdd");   // path to RPS database for domain hits
+opts->SetUseQueryClusters(true);
+
+// Construct aligner
+CMultiAligner aligner(opts);
+
+// Supply query sequences as a vector of CSeq_loc + CScope
+vector<CRef<CSeq_loc>> queries;
+CRef<CScope> scope(new CScope(*CObjectManager::GetInstance()));
+scope->AddDefaults();
+// ... populate queries ...
+aligner.SetQueries(queries, scope);
+
+// Run alignment
+CMultiAligner::TStatus status = aligner.Run();
+if (status != CMultiAligner::eSuccess) {
+    // handle error
+}
+
+// Retrieve result as a single CSeq_align (Dense-seg, global type)
+CRef<CSeq_align> msa_result = aligner.GetResults();
+```
+
+`CMultiAligner` also accepts input as `TSeqLocVector` (the same type used by `CLocalBlast`) through its `SetQueries(const blast::TSeqLocVector&)` overload, making it straightforward to pipeline BLAST query preparation into COBALT.
+
+## Traversing CSeq_align results
+
+All alignment classes ultimately return `CSeq_align` objects. For pairwise results the representation is typically a `Dense-seg`; for spliced alignments a `Spliced-seg` is used.
+
+```cpp
+#include <objects/seqalign/Seq_align.hpp>
+#include <objects/seqalign/Dense_seg.hpp>
+
+void PrintAlignment(const CSeq_align& aln)
+{
+    if (aln.GetSegs().IsDenseg()) {
+        const CDense_seg& ds = aln.GetSegs().GetDenseg();
+
+        int nseg = ds.GetNumseg();
+        const auto& starts = ds.GetStarts();
+        const auto& lens   = ds.GetLens();
+
+        for (int s = 0; s < nseg; ++s) {
+            TSeqPos qstart = starts[s * 2];
+            TSeqPos sstart = starts[s * 2 + 1];
+            TSeqPos len    = lens[s];
+
+            // A start of -1 indicates a gap in that row
+            if (qstart != (TSeqPos)-1 && sstart != (TSeqPos)-1) {
+                NcbiCout << "Aligned: q=" << qstart
+                         << " s=" << sstart
+                         << " len=" << len << NcbiEndl;
+            }
+        }
+    }
+
+    // Retrieve named scores
+    double evalue = 0;
+    int    score  = 0;
+    aln->GetNamedScore(CSeq_align::eScore_Score,  score);
+    aln->GetNamedScore(CSeq_align::eScore_EValue, evalue);
+}
+```
+
+## Algorithm comparison
+
+| Algorithm | Class | Use case | Complexity |
+|---|---|---|---|
+| Needleman-Wunsch global | `CNWAligner` | Two sequences, full-length alignment | O(mn) |
+| Smith-Waterman local | `CNWAligner` + `SetSmithWaterman` | Best local segment | O(mn) |
+| Banded global | `CBandAligner` | Near-identical sequences (≤K diffs) | O(n·K) |
+| Spliced cDNA-to-genome | `CSplign` | mRNA/EST mapping with introns | Depends on hit count |
+| Multiple (COBALT) | `CMultiAligner` | Protein MSA with domain constraints | Progressive |
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="BLAST Search" href="/algorithms/blast">
+    Generate the initial local hits that CSplign and CMultiAligner consume
+  </Card>
+  <Card title="Sequence Masking" href="/algorithms/sequence-masking">
+    Pre-filter low-complexity regions before alignment to improve speed and specificity
+  </Card>
+</CardGroup>

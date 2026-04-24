@@ -1,0 +1,475 @@
+---
+title: "NCBI DBAPI: Database Driver, Connection & Result APIs"
+description: "API reference for CDriverManager, IDataSource, IConnection, IStatement, IResultSet, and CVariant — NCBI's DBAPI layer for ctlib, FreeTDS, ODBC, SQLite3."
+---
+
+The NCBI DBAPI library (`dbapi`) provides a driver-agnostic interface for relational database access. Applications written against the pure `IConnection` / `IStatement` / `IResultSet` interfaces can switch between Sybase `ctlib`, FreeTDS `ftds`, Microsoft `odbc`, and `sqlite3` drivers by changing a single string. The `CDriverManager` singleton manages driver loading and data-source lifetime; `CVariant` provides type-safe access to column values.
+
+---
+
+## Supported drivers
+
+| Driver name | Description |
+|---|---|
+| `"ctlib"` | Sybase Client-Library (native Sybase / ASE) |
+| `"ftds"` | FreeTDS (Sybase and Microsoft SQL Server) |
+| `"odbc"` | ODBC (cross-platform; requires ODBC manager) |
+| `"sqlite3"` | SQLite3 (embedded, file-based) |
+
+---
+
+## CDriverManager
+
+`CDriverManager` is the top-level singleton that loads driver plug-ins and vends `IDataSource` instances.
+
+```cpp
+#include <dbapi/driver_mgr.hpp>
+#include <dbapi/dbapi.hpp>
+
+CDriverManager& dm = CDriverManager::GetInstance();
+IDataSource* ds = dm.CreateDs("ftds");
+```
+
+### GetInstance()
+
+```cpp
+static CDriverManager& GetInstance();
+```
+
+Returns the global `CDriverManager` singleton. Thread-safe.
+
+<ResponseField name="return" type="CDriverManager&">
+Reference to the singleton.
+</ResponseField>
+
+### CreateDs()
+
+```cpp
+IDataSource* CreateDs(const string&              driver_name,
+                      const map<string,string>*  attr = 0,
+                      const string&              tag  = kEmptyStr);
+```
+
+Creates (or retrieves a cached) `IDataSource` for the named driver.
+
+<ParamField path="driver_name" type="const string&" required>
+Driver identifier: `"ctlib"`, `"ftds"`, `"odbc"`, or `"sqlite3"`.
+</ParamField>
+<ParamField path="attr" type="const map<string,string>*">
+Optional driver-specific attributes passed to the driver context.
+</ParamField>
+<ParamField path="tag" type="const string&">
+Tag string allowing multiple `IDataSource` instances for the same driver with different parameters.
+</ParamField>
+
+<ResponseField name="return" type="IDataSource*">
+Pointer to the data source. Owned by `CDriverManager`; do not delete directly — use `DestroyDs()`.
+</ResponseField>
+
+### DestroyDs()
+
+```cpp
+void DestroyDs(const string& driver_name);
+void DestroyDs(const IDataSource* ds);
+```
+
+Releases the data source. All connections obtained from the source must be closed first.
+
+---
+
+## IDataSource
+
+`IDataSource` is the factory for database connections. Obtain it from `CDriverManager::CreateDs()`.
+
+### CreateConnection()
+
+```cpp
+virtual IConnection* CreateConnection(
+    EOwnership ownership = eNoOwnership
+) = 0;
+```
+
+Creates a new database connection. The connection is not opened until `IConnection::Connect()` is called.
+
+<ParamField path="ownership" type="EOwnership">
+Pass `eTakeOwnership` to have the connection deleted when the data source is destroyed. The default `eNoOwnership` leaves deletion responsibility with the caller.
+</ParamField>
+
+<ResponseField name="return" type="IConnection*">
+Raw pointer to a new connection object.
+</ResponseField>
+
+### SetLoginTimeout()
+
+```cpp
+virtual void SetLoginTimeout(unsigned int i) = 0;
+```
+
+Sets the maximum time (in seconds) to wait for a new connection to be established. A value of `0` means infinite.
+
+<ParamField path="i" type="unsigned int" required>
+Timeout in seconds.
+</ParamField>
+
+### SetLogStream()
+
+```cpp
+virtual void SetLogStream(ostream* out) = 0;
+```
+
+Redirects server messages to `out`. Pass `nullptr` to suppress output and collect messages via `GetErrorAsEx()`.
+
+---
+
+## IConnection
+
+`IConnection` represents a single open database connection and is the factory for `IStatement`, `ICursor`, and `IBulkInsert` objects.
+
+```cpp
+unique_ptr<IConnection> conn(ds->CreateConnection(eTakeOwnership));
+conn->Connect("user", "password", "server", "database");
+```
+
+### Connect()
+
+```cpp
+virtual void Connect(
+    const string& user,
+    const string& password,
+    const string& server,
+    const string& database = kEmptyStr
+) = 0;
+```
+
+Opens the physical database connection.
+
+<ParamField path="user" type="const string&" required>
+Database login name.
+</ParamField>
+<ParamField path="password" type="const string&" required>
+Login password.
+</ParamField>
+<ParamField path="server" type="const string&" required>
+Server name or DSN (driver-specific format).
+</ParamField>
+<ParamField path="database" type="const string&">
+Initial database to select. If empty, the server default is used.
+</ParamField>
+
+### CreateStatement()
+
+```cpp
+virtual IStatement* CreateStatement() = 0;
+```
+
+Creates a new `IStatement` for executing SQL. Multiple statements may be open simultaneously on one connection.
+
+<ResponseField name="return" type="IStatement*">
+Caller-owned pointer to a new statement object.
+</ResponseField>
+
+### CreateCursor()
+
+```cpp
+virtual ICursor* CreateCursor(
+    const string& name,
+    const string& sql,
+    int           batchSize
+) = 0;
+```
+
+Creates a server-side cursor over the given SQL query.
+
+<ParamField path="name" type="const string&" required>
+Cursor name (must be unique within the connection).
+</ParamField>
+<ParamField path="sql" type="const string&" required>
+SQL SELECT statement for the cursor.
+</ParamField>
+<ParamField path="batchSize" type="int" required>
+Number of rows to prefetch per server round-trip.
+</ParamField>
+
+### Commit() / Rollback()
+
+`IConnection` does not expose `Commit()` / `Rollback()` as named methods. Use `DBAPI_MakeTrans()` to create an RAII transaction guard, or issue `ExecuteUpdate("COMMIT")` and `ExecuteUpdate("ROLLBACK")` via `IStatement`.
+
+```cpp
+// RAII transaction
+{
+    auto trans = DBAPI_MakeTrans(*conn);
+    unique_ptr<IStatement> st(conn->CreateStatement());
+    st->ExecuteUpdate("INSERT INTO t VALUES (1)");
+    trans.Commit();
+}
+```
+
+### SetTimeout()
+
+```cpp
+virtual void SetTimeout(size_t nof_secs) = 0;
+```
+
+Sets the command execution timeout for this connection.
+
+<ParamField path="nof_secs" type="size_t" required>
+Timeout in seconds. Pass `0` for infinite.
+</ParamField>
+
+---
+
+## IStatement
+
+`IStatement` executes SQL and provides access to result sets. Obtain it from `IConnection::CreateStatement()`.
+
+### Execute()
+
+```cpp
+virtual void Execute(const string& sql) = 0;
+```
+
+Sends one or more SQL statements to the server. Results are pending until `HasMoreResults()` / `GetResultSet()` are called.
+
+<ParamField path="sql" type="const string&" required>
+SQL statement to execute. May contain multiple statements separated by semicolons (driver-dependent).
+</ParamField>
+
+### ExecuteUpdate()
+
+```cpp
+virtual void ExecuteUpdate(const string& sql) = 0;
+```
+
+Executes a DML/DDL statement and discards all result sets. More efficient than `Execute()` when no rows are expected.
+
+### GetResultSet()
+
+```cpp
+virtual IResultSet* GetResultSet() = 0;
+```
+
+Returns a pointer to the current result set. The pointer is valid until `HasMoreResults()` is called again or the statement is closed.
+
+<ResponseField name="return" type="IResultSet*">
+Current result set, or `nullptr` if no results are available.
+</ResponseField>
+
+### HasMoreResults()
+
+```cpp
+virtual bool HasMoreResults() = 0;
+```
+
+Advances to the next pending result set. Returns `true` if another result set is available. Each call cancels the previous result set.
+
+<ResponseField name="return" type="bool">
+`true` if there is another result set to retrieve.
+</ResponseField>
+
+### Full execute example
+
+```cpp
+unique_ptr<IStatement> st(conn->CreateStatement());
+st->Execute("SELECT name, gi FROM sequences WHERE gi > 1000");
+
+while (st->HasMoreResults()) {
+    if (!st->HasRows()) continue;
+    IResultSet* rs = st->GetResultSet();
+    while (rs->Next()) {
+        string name = rs->GetVariant(1).GetString();
+        Int4   gi   = rs->GetVariant(2).GetInt4();
+        cout << name << "\t" << gi << "\n";
+    }
+}
+```
+
+---
+
+## IResultSet
+
+`IResultSet` iterates over the rows returned by an `IStatement`.
+
+### Next()
+
+```cpp
+virtual bool Next() = 0;
+```
+
+Advances to the next row. Must be called before the first row is accessible.
+
+<ResponseField name="return" type="bool">
+`true` if a row was fetched; `false` at end of results.
+</ResponseField>
+
+### GetVariant()
+
+```cpp
+virtual const CVariant& GetVariant(const CDBParamVariant& param) = 0;
+```
+
+Returns the value of a column as a `CVariant`. Columns are 1-based.
+
+<ParamField path="param" type="const CDBParamVariant&" required>
+Column number (1-based integer) or column name string.
+</ParamField>
+
+<ResponseField name="return" type="const CVariant&">
+Variant holding the column value. Call `IsNull()` before casting to a concrete type.
+</ResponseField>
+
+### GetColumnNo()
+
+```cpp
+virtual int GetColumnNo() = 0;
+```
+
+Returns the 1-based index of the column currently available for `Read()` (used when column binding is disabled).
+
+### GetTotalColumns()
+
+```cpp
+virtual unsigned int GetTotalColumns() = 0;
+```
+
+Returns the total number of columns in the current result set.
+
+---
+
+## CVariant
+
+`CVariant` is a tagged-union value type used for database column values and parameters. Every column value returned by `IResultSet::GetVariant()` is a `CVariant`.
+
+```cpp
+#include <dbapi/variant.hpp>
+
+const CVariant& v = rs->GetVariant(1);
+if (!v.IsNull()) {
+    cout << v.GetString() << "\n";
+}
+```
+
+### Constructors and factories
+
+```cpp
+// Construct from primitive types
+explicit CVariant(Int8   v);
+explicit CVariant(Int4   v);
+explicit CVariant(float  v);
+explicit CVariant(double v);
+explicit CVariant(bool   v);
+explicit CVariant(const string& v);
+
+// Construct a typed NULL placeholder
+CVariant(EDB_Type type, size_t size = 0);
+
+// Static factories (pass NULL pointer for SQL NULL)
+static CVariant BigInt (Int8*   p);
+static CVariant Int    (Int4*   p);
+static CVariant Double (double* p);
+static CVariant VarChar(const char* p, size_t len = 0);
+static CVariant DateTime(CTime* p);
+```
+
+### Value accessors
+
+<Accordion title="AsString() / GetString()">
+
+```cpp
+string GetString(void) const;
+```
+
+Returns the column value as a `std::string`. Works for any column type; numeric types are formatted as decimal strings.
+
+</Accordion>
+
+<Accordion title="AsInt4() / GetInt4()">
+
+```cpp
+Int4 GetInt4(void) const;
+```
+
+Returns the value as a 32-bit signed integer. Throws `CVariantException` if the conversion is not valid.
+
+</Accordion>
+
+<Accordion title="AsInt8() / GetInt8()">
+
+```cpp
+Int8 GetInt8(void) const;
+```
+
+Returns the value as a 64-bit signed integer.
+
+</Accordion>
+
+<Accordion title="AsFloat() / GetFloat()">
+
+```cpp
+float GetFloat(void) const;
+```
+
+Returns the value as a `float`.
+
+</Accordion>
+
+<Accordion title="AsDouble() / GetDouble()">
+
+```cpp
+double GetDouble(void) const;
+```
+
+Returns the value as a `double`.
+
+</Accordion>
+
+### IsNull()
+
+```cpp
+bool IsNull() const;
+```
+
+Returns `true` if the column is SQL NULL. Always call this before calling a type accessor.
+
+---
+
+## Complete end-to-end example
+
+```cpp
+#include <dbapi/driver_mgr.hpp>
+#include <dbapi/dbapi.hpp>
+#include <iostream>
+
+USING_NCBI_SCOPE;
+
+int main()
+{
+    // 1. Obtain driver manager and data source
+    CDriverManager& dm = CDriverManager::GetInstance();
+    IDataSource*    ds = dm.CreateDs("ftds");
+    ds->SetLoginTimeout(15);
+
+    // 2. Open connection
+    unique_ptr<IConnection> conn(ds->CreateConnection(eTakeOwnership));
+    conn->Connect("guest", "secret", "DEVSERVER", "mydb");
+
+    // 3. Run query
+    unique_ptr<IStatement> st(conn->CreateStatement());
+    st->Execute("SELECT accession, length FROM sequences WHERE taxid = 9606");
+
+    while (st->HasMoreResults()) {
+        if (!st->HasRows()) continue;
+        IResultSet* rs = st->GetResultSet();
+        while (rs->Next()) {
+            const CVariant& acc = rs->GetVariant(1);
+            const CVariant& len = rs->GetVariant(2);
+            if (!acc.IsNull())
+                cout << acc.GetString() << "\t"
+                     << (len.IsNull() ? -1 : len.GetInt4()) << "\n";
+        }
+    }
+
+    conn->Close();
+    dm.DestroyDs(ds);
+    return 0;
+}
+```

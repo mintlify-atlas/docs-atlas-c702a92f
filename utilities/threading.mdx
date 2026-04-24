@@ -1,0 +1,546 @@
+---
+title: 'Threading and Synchronization in the NCBI C++ Toolkit'
+description: 'Use CThread, CMutex, CRWLock, CSemaphore, CThreadPool, and CSyncQueue to write correct concurrent NCBI C++ applications on all supported platforms.'
+---
+
+The NCBI C++ Toolkit provides a complete set of threading primitives in `<corelib/ncbithr.hpp>` and `<corelib/ncbimtx.hpp>`, along with higher-level utilities in `<util/thread_pool.hpp>` and `<util/sync_queue.hpp>`. These classes abstract over POSIX threads and Win32 threads so that the same code runs on all supported platforms. The toolkit threads integrate tightly with the logging and diagnostic subsystems, making it straightforward to write correct, debuggable concurrent NCBI applications.
+
+## CThread — the base thread class
+
+`CThread` (defined in `<corelib/ncbithr.hpp>`) is the base class for all user-defined threads. Every thread object must be allocated on the heap — the toolkit manages its own lifetime through internal reference counting.
+
+<Warning>
+Never allocate a `CThread`-derived object on the stack. The toolkit calls `delete` on the thread object when it finishes, and this will corrupt the stack if the object is not heap-allocated.
+</Warning>
+
+### Subclassing CThread
+
+Override the pure-virtual `Main()` method to define what the thread does. Override the virtual `OnExit()` method for cleanup that must run inside the thread (for example, releasing thread-local resources before the thread terminates).
+
+```cpp
+#include <corelib/ncbithr.hpp>
+
+USING_NCBI_SCOPE;
+
+class CWorkerThread : public CThread
+{
+public:
+    CWorkerThread(int id) : m_Id(id) {}
+
+protected:
+    // Must be protected — toolkit calls delete on the thread
+    virtual ~CWorkerThread() {}
+
+    // Pure virtual from CThread: implement the thread's work here
+    virtual void* Main() override
+    {
+        LOG_POST("Worker " << m_Id << " started");
+        // ... do work ...
+        return nullptr;
+    }
+
+    // Called just before the thread terminates, inside the thread
+    virtual void OnExit() override
+    {
+        LOG_POST("Worker " << m_Id << " cleaning up");
+    }
+
+private:
+    int m_Id;
+};
+```
+
+### Run, Join, and Detach
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `Run()` | `bool Run(TRunMode flags = fRunDefault)` | Creates the OS thread and calls `Main()`. Returns `false` if the thread is already running. |
+| `Join()` | `void Join(void** exit_data = 0)` | Blocks the caller until the thread terminates. Only one call per thread. |
+| `Detach()` | `void Detach(void)` | Tells the toolkit the caller will not call `Join()`. The thread object is destroyed when `Main()` returns. |
+| `Exit()` | `static void Exit(void* exit_data)` | Terminates the current thread (throws internally). |
+| `Discard()` | `bool Discard(void)` | Cancels a thread that has not yet been `Run()`. |
+| `IsTerminated()` | `bool IsTerminated(void) const` | Returns `true` if `Exit()` was called. |
+| `GetSelf()` | `static TID GetSelf(void)` | Returns the numeric ID of the calling thread. |
+| `IsMain()` | `static bool IsMain(void)` | Returns `true` if called from the main thread. |
+| `IsAppExiting()` | `static bool IsAppExiting(void)` | Returns `true` during application shutdown. Use as a loop condition in long-running threads. |
+
+```cpp
+// Heap-allocate and start the thread
+CRef<CWorkerThread> thr(new CWorkerThread(1));
+thr->Run();
+
+// Wait for it to finish
+thr->Join();
+```
+
+To run a thread and let the toolkit reclaim it automatically when done:
+
+```cpp
+CRef<CWorkerThread> thr(new CWorkerThread(2));
+thr->Run(CThread::fRunDetached);
+// Do not call Join() — the thread is self-cleaning
+```
+
+### Run mode flags
+
+| Flag | Effect |
+|------|--------|
+| `fRunDefault` | Default joinable thread |
+| `fRunDetached` | Thread is non-joinable; object is destroyed automatically on exit |
+| `fRunNice` | Run at low priority (Windows only) |
+| `fRunAllowST` | Allow the thread to run even in single-threaded builds |
+| `fRunCloneRequestContext` | Clone the parent request context into the new thread |
+
+---
+
+## Mutex types
+
+The toolkit provides two mutex classes suited to different use cases.
+
+<Tabs>
+  <Tab title="CMutex (recursive)">
+
+`CMutex` supports recursive locking: the same thread may call `Lock()` multiple times without deadlocking, provided it calls `Unlock()` the same number of times. It also tracks ownership and validates that only the owning thread unlocks it.
+
+```cpp
+#include <corelib/ncbimtx.hpp>
+
+USING_NCBI_SCOPE;
+
+CMutex g_Mutex;
+
+void SafeUpdate(int& counter)
+{
+    CMutexGuard guard(g_Mutex); // locks on construction
+    ++counter;
+    // guard unlocks on destruction (RAII)
+}
+
+void NestedSafe(int& counter)
+{
+    CMutexGuard outer(g_Mutex);
+    // Same thread may lock again:
+    CMutexGuard inner(g_Mutex); // succeeds — same thread
+    ++counter;
+}
+```
+
+**When to use:** When you need recursive locking or when correctness checking (wrong-thread unlock detection) is worth the slight overhead.
+
+  </Tab>
+  <Tab title="CFastMutex (non-recursive)">
+
+`CFastMutex` does not check ownership or support recursive locking. It is faster than `CMutex` because it avoids the overhead of owner tracking, but attempting to lock it twice from the same thread will deadlock.
+
+```cpp
+#include <corelib/ncbimtx.hpp>
+
+USING_NCBI_SCOPE;
+
+CFastMutex g_FastMutex;
+
+void FastUpdate(int& counter)
+{
+    CFastMutexGuard guard(g_FastMutex); // locks on construction
+    ++counter;
+    // guard unlocks on destruction (RAII)
+}
+```
+
+**When to use:** In performance-critical sections where you can guarantee no recursive locking and the same thread always unlocks.
+
+  </Tab>
+</Tabs>
+
+<Tip>
+Always use the RAII guard classes (`CMutexGuard`, `CFastMutexGuard`) rather than calling `Lock()` and `Unlock()` directly. Guards guarantee the mutex is released even if an exception is thrown.
+</Tip>
+
+### RAII guard classes
+
+| Guard | Protects | Defined as |
+|-------|----------|------------|
+| `CMutexGuard` | `CMutex` | `typedef CGuard<SSystemMutex> TMutexGuard` |
+| `CFastMutexGuard` | `CFastMutex` / `SSystemFastMutex` | `typedef CGuard<SSystemFastMutex> TFastMutexGuard` |
+
+---
+
+## CRWLock — readers-writer lock
+
+`CRWLock` allows multiple simultaneous readers or a single exclusive writer. Use it when reads are far more frequent than writes, which is common for shared lookup tables and configuration data.
+
+<Tabs>
+  <Tab title="Mutex (exclusive access)">
+
+```cpp
+CMutex g_Mutex;
+map<string, string> g_Cache;
+
+// Every access is exclusive — only one thread at a time
+string Get(const string& key)
+{
+    CMutexGuard guard(g_Mutex);
+    auto it = g_Cache.find(key);
+    return it != g_Cache.end() ? it->second : "";
+}
+
+void Put(const string& key, const string& val)
+{
+    CMutexGuard guard(g_Mutex);
+    g_Cache[key] = val;
+}
+```
+
+  </Tab>
+  <Tab title="CRWLock (concurrent reads)">
+
+```cpp
+#include <corelib/ncbimtx.hpp>
+
+USING_NCBI_SCOPE;
+
+CRWLock g_Lock;
+map<string, string> g_Cache;
+
+// Multiple threads can read simultaneously
+string Get(const string& key)
+{
+    CReadLockGuard guard(g_Lock); // acquires a shared read lock
+    auto it = g_Cache.find(key);
+    return it != g_Cache.end() ? it->second : "";
+}
+
+// Writers get exclusive access
+void Put(const string& key, const string& val)
+{
+    CWriteLockGuard guard(g_Lock); // acquires an exclusive write lock
+    g_Cache[key] = val;
+}
+```
+
+  </Tab>
+</Tabs>
+
+### CRWLock API
+
+```cpp
+class CRWLock
+{
+public:
+    // flags: fFavorWriters — prevent writer starvation
+    CRWLock(TFlags flags = 0);
+
+    void ReadLock(void);
+    void WriteLock(void);
+
+    bool TryReadLock(void);
+    bool TryReadLock(const CTimeout& timeout);
+    bool TryWriteLock(void);
+    bool TryWriteLock(const CTimeout& timeout);
+
+    void Unlock(void);
+
+    typedef CReadLockGuard  TReadLockGuard;
+    typedef CWriteLockGuard TWriteLockGuard;
+};
+```
+
+<Note>
+Recursive locking rules: R-after-R and W-after-W from the same thread are allowed. R-after-W is treated as a nested write lock. W-after-R is not permitted and may cause a deadlock in release builds — always test in debug mode first.
+</Note>
+
+---
+
+## CSemaphore — counting semaphore
+
+`CSemaphore` (defined in `<corelib/ncbimtx.hpp>`) implements a classic counting semaphore. It is useful for signaling between threads and limiting concurrent access to a resource pool.
+
+```cpp
+#include <corelib/ncbimtx.hpp>
+
+USING_NCBI_SCOPE;
+
+// Allow at most 5 concurrent database connections
+CSemaphore g_ConnPool(5, 5); // init_count=5, max_count=5
+
+void UseConnection()
+{
+    g_ConnPool.Wait();        // blocks if count == 0
+    try {
+        // ... use a connection ...
+    } catch (...) {
+        g_ConnPool.Post();    // always release
+        throw;
+    }
+    g_ConnPool.Post();        // release slot
+}
+
+bool TryUseConnection()
+{
+    // Try for up to 100 ms
+    if (!g_ConnPool.TryWait(0, 100000000)) {
+        return false;         // timed out
+    }
+    // ... use connection ...
+    g_ConnPool.Post();
+    return true;
+}
+```
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| Constructor | `CSemaphore(unsigned int init_count, unsigned int max_count)` | Creates a semaphore with initial and maximum counts. |
+| `Wait()` | `void Wait(void)` | Decrements the counter; blocks if it is zero. |
+| `TryWait()` | `bool TryWait(unsigned int timeout_sec = 0, unsigned int timeout_nsec = 0)` | Attempts a decrement within the timeout; returns `false` on timeout. |
+| `TryWait()` | `bool TryWait(const CTimeout& timeout)` | Overload accepting `CTimeout`. |
+| `Post()` | `void Post(unsigned int count = 1)` | Increments the counter by `count`; throws if this would exceed `max_count`. |
+
+---
+
+## CConditionVariable
+
+`CConditionVariable` (defined in `<corelib/ncbimtx.hpp>`) allows a thread to atomically release a mutex and wait for a signal from another thread.
+
+```cpp
+#include <corelib/ncbimtx.hpp>
+
+USING_NCBI_SCOPE;
+
+CMutex           g_Mutex;
+CConditionVariable g_Cv;
+bool             g_DataReady = false;
+string           g_Data;
+
+// Producer thread
+void Produce()
+{
+    CMutexGuard guard(g_Mutex);
+    g_Data = "result";
+    g_DataReady = true;
+    g_Cv.SignalAll();  // wake all waiters
+}
+
+// Consumer thread
+void Consume()
+{
+    CMutexGuard guard(g_Mutex);
+    while (!g_DataReady) {
+        // Atomically releases g_Mutex, waits, then re-acquires it
+        g_Cv.WaitForSignal(g_Mutex);
+    }
+    LOG_POST("Got: " << g_Data);
+}
+```
+
+| Method | Description |
+|--------|-------------|
+| `WaitForSignal(CMutex&, const CDeadline&)` | Releases the `CMutex` and blocks until signaled or the deadline passes. Returns `true` on signal, `false` on timeout. |
+| `WaitForSignal(CFastMutex&, const CDeadline&)` | Same but accepts `CFastMutex`. |
+| `SignalSome()` | Wakes at least one waiting thread. |
+| `SignalAll()` | Wakes all waiting threads. |
+| `IsSupported()` | Returns `false` on platforms that lack condition variable support. |
+
+---
+
+## CAtomicCounter and CAtomicCounter_WithAutoInit
+
+`CAtomicCounter` provides lock-free integer increment, decrement, and compare-and-swap. `CAtomicCounter_WithAutoInit` zero-initializes itself automatically, making it safe to use as a class member or static variable without an explicit constructor call.
+
+```cpp
+#include <corelib/ncbicntr.hpp>
+
+USING_NCBI_SCOPE;
+
+CAtomicCounter_WithAutoInit g_TaskCount; // starts at 0
+
+void WorkerThread()
+{
+    g_TaskCount.Add(1);   // atomic increment
+    // ... work ...
+    g_TaskCount.Add(-1);  // atomic decrement
+}
+
+void WaitForAll()
+{
+    while (g_TaskCount.Get() > 0) {
+        SleepMilliSec(10);
+    }
+}
+```
+
+---
+
+## CThreadPool — task-based parallelism
+
+`CThreadPool` (defined in `<util/thread_pool.hpp>`) manages a pool of reusable worker threads. Submit tasks by subclassing `CThreadPool_Task` and overriding `Execute()`.
+
+<Steps>
+  <Step title="Define a task">
+
+```cpp
+#include <util/thread_pool.hpp>
+
+USING_NCBI_SCOPE;
+
+class CAlignTask : public CThreadPool_Task
+{
+public:
+    CAlignTask(const string& seq, unsigned int priority = 0)
+        : CThreadPool_Task(priority), m_Seq(seq) {}
+
+    virtual EStatus Execute() override
+    {
+        if (IsCancelRequested()) {
+            return eCanceled;
+        }
+        // ... perform alignment on m_Seq ...
+        LOG_POST("Aligned: " << m_Seq.size() << " bp");
+        return eCompleted;
+    }
+
+private:
+    string m_Seq;
+};
+```
+
+  </Step>
+  <Step title="Create the pool and submit tasks">
+
+```cpp
+// queue_size=100, max_threads=8, min_threads=2
+CThreadPool pool(100, 8, 2);
+
+vector<string> sequences = LoadSequences();
+for (const auto& seq : sequences) {
+    CRef<CAlignTask> task(new CAlignTask(seq));
+    pool.AddTask(task.GetPointer());
+}
+```
+
+  </Step>
+  <Step title="Wait for completion and check status">
+
+```cpp
+// AddTask() blocks when the queue is full; when the pool
+// destructor runs it waits up to the destroy timeout (default 10s)
+// for all threads to finish.
+
+// Optionally cancel all queued tasks:
+pool.CancelTasks(CThreadPool::fCancelQueuedTasks);
+
+// Abort everything (renders pool unusable afterward):
+pool.Abort();
+```
+
+  </Step>
+</Steps>
+
+### CThreadPool constructor
+
+```cpp
+CThreadPool(
+    unsigned int      queue_size,   // max pending tasks; 0 = no queue
+    unsigned int      max_threads,  // upper thread limit
+    unsigned int      min_threads = 2,
+    CThread::TRunMode threads_mode = CThread::fRunDefault
+);
+```
+
+### Key CThreadPool methods
+
+| Method | Description |
+|--------|-------------|
+| `AddTask(task, timeout)` | Enqueues a task; blocks if the queue is full. |
+| `CancelTask(task)` | Removes a queued task; sets status to `eCanceled`. |
+| `GetThreadsCount()` | Returns the current number of live threads. |
+| `GetQueuedTasksCount()` | Returns the number of tasks waiting in the queue. |
+| `GetExecutingTasksCount()` | Returns the number of tasks currently executing. |
+| `Abort(timeout)` | Cancels all tasks and terminates the pool. |
+| `IsAborted()` | Returns `true` after `Abort()` is called. |
+
+<Warning>
+After calling `Abort()`, do not call any other method on the `CThreadPool` object. The pool is unusable from that point on.
+</Warning>
+
+---
+
+## CSyncQueue&lt;T&gt; — thread-safe producer-consumer queue
+
+`CSyncQueue<T>` (defined in `<util/sync_queue.hpp>`) is a bounded, thread-safe queue with blocking `Push()` and `Pop()` operations. It is designed for classic producer-consumer patterns.
+
+```cpp
+#include <util/sync_queue.hpp>
+
+USING_NCBI_SCOPE;
+
+typedef CSyncQueue<string> TStringQueue;
+TStringQueue g_Queue(100); // max 100 items
+
+// Producer thread
+class CProducer : public CThread
+{
+protected:
+    ~CProducer() {}
+    virtual void* Main() override
+    {
+        for (int i = 0; i < 1000; ++i) {
+            string item = "item_" + to_string(i);
+            g_Queue.Push(item); // blocks if queue is full
+        }
+        return nullptr;
+    }
+};
+
+// Consumer thread
+class CConsumer : public CThread
+{
+protected:
+    ~CConsumer() {}
+    virtual void* Main() override
+    {
+        while (!CThread::IsAppExiting()) {
+            CTimeSpan timeout(1, 0); // 1 second timeout
+            try {
+                string item = g_Queue.Pop(&timeout);
+                Process(item);
+            } catch (const CSyncQueueException&) {
+                // timeout — check exit condition and try again
+            }
+        }
+        return nullptr;
+    }
+    void Process(const string& item) { /* ... */ }
+};
+```
+
+### CSyncQueue API
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| Constructor | `CSyncQueue(TSize max_size)` | Creates a bounded queue. `max_size` must be greater than zero. |
+| `Push()` | `void Push(const TValue& elem, const CTimeSpan* timeout = NULL)` | Adds an element; blocks if full. Throws `CSyncQueueException` on timeout. |
+| `Pop()` | `TValue Pop(const CTimeSpan* timeout = NULL)` | Removes and returns an element; blocks if empty. |
+| `IsEmpty()` | `bool IsEmpty(void) const` | Returns `true` if empty. Never blocks. |
+| `IsFull()` | `bool IsFull(void) const` | Returns `true` if the queue has reached `max_size`. Never blocks. |
+| `GetSize()` | `TSize GetSize(void) const` | Returns the current number of elements. |
+| `GetMaxSize()` | `TSize GetMaxSize(void) const` | Returns the capacity. |
+| `Clear()` | `void Clear(const CTimeSpan* timeout = NULL)` | Removes all elements. |
+
+---
+
+## Concurrency quick-reference
+
+<Columns cols={2}>
+  <Card title="Choose the right lock" icon="lock">
+    Use `CFastMutex` for non-recursive, performance-critical locks. Use `CMutex` when you need recursive locking or ownership validation. Use `CRWLock` for read-heavy data structures.
+  </Card>
+  <Card title="Always use RAII guards" icon="shield">
+    Prefer `CMutexGuard`, `CFastMutexGuard`, `CReadLockGuard`, and `CWriteLockGuard` over manual `Lock()`/`Unlock()` calls to ensure correctness under exceptions.
+  </Card>
+  <Card title="Thread pool over raw threads" icon="list">
+    For batch workloads, use `CThreadPool` with `CThreadPool_Task`. It handles thread reuse, task queuing, cancellation, and graceful shutdown automatically.
+  </Card>
+  <Card title="CSyncQueue for pipelines" icon="arrow-right">
+    Use `CSyncQueue<T>` to connect producer and consumer threads. Its bounded capacity provides natural backpressure without manual semaphore bookkeeping.
+  </Card>
+</Columns>

@@ -1,0 +1,374 @@
+---
+title: "NCBI CException Hierarchy, Throwing, and Catching"
+description: "Define and throw typed NCBI exceptions using CException, NCBI_THROW, NCBI_RETHROW, and custom subclasses created with NCBI_EXCEPTION_DEFAULT."
+---
+
+The NCBI C++ Toolkit defines its own exception hierarchy rooted at `CException`, which extends `std::exception` with structured error codes, severity levels, source location capture, and exception chaining. The accompanying macros — `NCBI_THROW`, `NCBI_RETHROW`, and `NCBI_CATCH` — integrate tightly with the diagnostic system so that unhandled exceptions produce rich, contextual output automatically.
+
+## CException Hierarchy
+
+`CException` is the base of all NCBI toolkit exceptions. It is declared in `<corelib/ncbiexpt.hpp>`:
+
+```
+std::exception
+    └── CException                  (eUnknown, eInvalid)
+            └── CCoreException      (eCore, eNullPtr, eDll, eDiagFilter, eInvalidArg)
+                    ├── CAppException    (eUnsetArgs, eSetupDiag, eLoadConfig, ...)
+                    ├── CArgException    (eInvalidArg, eNoValue, eWrongCast, ...)
+                    └── CObjectException (eRefDelete, eDeleted, eNoRef, ...)
+```
+
+Every derived class declares its own `EErrCode` enum and uses `NCBI_EXCEPTION_DEFAULT` to generate the necessary constructor, copy constructor, `GetType()`, `GetErrCode()`, and `Throw()` implementations.
+
+## CException Key Methods
+
+From `ncbiexpt.hpp`:
+
+```cpp
+class CException : public std::exception
+{
+public:
+    // Get the human-readable message passed to the throw macro
+    const string& GetMsg(void) const;
+
+    // Get the numeric error code (cast to the derived EErrCode)
+    TErrCode GetErrCode(void) const;
+
+    // Get severity associated with this exception
+    EDiagSev GetSeverity(void) const;
+
+    // Get class name of the most-derived type
+    virtual const char* GetType(void) const;
+
+    // Get error code as a string (overridden per class)
+    virtual const char* GetErrCodeString(void) const;
+
+    // Source location
+    const string& GetFile(void)     const;
+    int           GetLine(void)     const;
+    const string& GetModule(void)   const;
+    const string& GetFunction(void) const;
+
+    // Chain: predecessor exception that caused this one
+    const CException* GetPredecessor(void) const;
+
+    // std::exception interface
+    virtual const char* what(void) const noexcept;
+};
+```
+
+## Throwing Exceptions with NCBI_THROW
+
+`NCBI_THROW` is the standard way to create and throw NCBI exceptions. It captures file, line, and function at the call site automatically:
+
+```cpp
+#include <corelib/ncbiexpt.hpp>
+USING_NCBI_SCOPE;
+
+// Throw a CException with error code eUnknown
+NCBI_THROW(CException, eUnknown, "Something unexpected occurred");
+
+// Throw a CCoreException
+NCBI_THROW(CCoreException, eInvalidArg,
+           "Parameter 'count' must be positive");
+
+// Throw with a formatted message (stream syntax)
+NCBI_THROW_FMT(CCoreException, eInvalidArg,
+               "Expected [1," << max_val << "], got " << actual);
+```
+
+`NCBI_USER_THROW` is a shorthand for one-off application exceptions:
+
+```cpp
+// Equivalent to NCBI_THROW(CException, eUnknown, message)
+NCBI_USER_THROW("Input file not found: " + path);
+NCBI_USER_THROW_FMT("Record " << id << " has invalid format");
+```
+
+## Catching Exceptions
+
+<Tabs>
+
+<Tab title="NCBI_CATCH">
+
+`NCBI_CATCH` catches both `CException` (reporting via `NCBI_REPORT_EXCEPTION`) and `std::exception`:
+
+```cpp
+try {
+    ProcessRecord(id);
+}
+NCBI_CATCH("ProcessRecord failed")
+// Automatically logs: "ProcessRecord failed: <exception details>"
+```
+
+`NCBI_CATCH_ALL` also catches non-standard exceptions (anything not derived from `std::exception`):
+
+```cpp
+try {
+    RunExperiment();
+}
+NCBI_CATCH_ALL("RunExperiment")
+```
+
+</Tab>
+
+<Tab title="Manual catch">
+
+For cases where you need to inspect the exception before deciding how to handle it:
+
+```cpp
+try {
+    LoadDatabase(path);
+}
+catch (const CArgException& ex) {
+    // CArgException-specific handling
+    cerr << "Argument error: " << ex.GetMsg() << "\n";
+    cerr << "Code: " << ex.GetErrCodeString() << "\n";
+    return 1;
+}
+catch (const CException& ex) {
+    // All other NCBI exceptions
+    ERR_POST(Error << "Database load failed: " << ex.GetMsg());
+    return 2;
+}
+catch (const exception& ex) {
+    // Standard C++ exceptions
+    ERR_POST(Critical << "Unexpected std exception: " << ex.what());
+    return 3;
+}
+```
+
+</Tab>
+
+</Tabs>
+
+## Exception Chaining with NCBI_RETHROW
+
+`NCBI_RETHROW` creates a new exception that references the caught one as its "predecessor", forming a chain that preserves the full error context:
+
+```cpp
+void LoadConfig(const string& path)
+{
+    try {
+        ReadFile(path);
+    }
+    catch (const CException& prev) {
+        // Wrap the original exception with higher-level context
+        NCBI_RETHROW(prev, CAppException, eLoadConfig,
+                     "Cannot load configuration from: " + path);
+    }
+}
+```
+
+The resulting exception's `GetPredecessor()` returns a pointer to `prev`, and `what()` / `ReportAll()` prints the complete chain.
+
+`NCBI_RETHROW_SAME` adds a message to the existing exception's backlog without changing its type:
+
+```cpp
+catch (CException& ex) {
+    // Add context without changing the exception type
+    NCBI_RETHROW_SAME(ex, "Context: processing record " + id);
+    // throws the original exception with augmented message
+}
+```
+
+## Defining Custom Exception Classes
+
+Use `NCBI_EXCEPTION_DEFAULT` to define a new exception class with minimal boilerplate. The macro generates constructors, `GetType()`, `GetErrCode()`, and `Throw()`:
+
+```cpp
+class CMyLibException : public CException
+{
+public:
+    enum EErrCode {
+        eParseError,      ///< Input could not be parsed
+        eOutOfRange,      ///< Value out of acceptable range
+        eNotFound,        ///< Requested item does not exist
+        ePermission       ///< Insufficient permissions
+    };
+
+    /// Convert error code to string for reporting
+    virtual const char* GetErrCodeString(void) const override
+    {
+        switch (GetErrCode()) {
+        case eParseError:  return "eParseError";
+        case eOutOfRange:  return "eOutOfRange";
+        case eNotFound:    return "eNotFound";
+        case ePermission:  return "ePermission";
+        default:           return CException::GetErrCodeString();
+        }
+    }
+
+    // Generate all required boilerplate
+    NCBI_EXCEPTION_DEFAULT(CMyLibException, CException);
+};
+```
+
+Throw and catch your custom exception class the same way as any other:
+
+```cpp
+// Throw
+NCBI_THROW(CMyLibException, eParseError,
+           "Unexpected token at line " + NStr::IntToString(line));
+
+// Catch
+catch (const CMyLibException& ex) {
+    if (ex.GetErrCode() == CMyLibException::eNotFound) {
+        return TryAlternative();
+    }
+    throw; // re-throw unhandled codes
+}
+```
+
+<Note>
+`NCBI_EXCEPTION_DEFAULT` can only be used when the derived class has no additional data members. If you need to store extra state (e.g., an HTTP status code), you must write the constructors manually and use `NCBI_EXCEPTION_DEFAULT_IMPLEMENTATION` for the common methods.
+</Note>
+
+## Severity Manipulators on Exceptions
+
+You can adjust the severity of a thrown exception using manipulators combined with the error code:
+
+```cpp
+// Throw at Info severity instead of the default Error
+NCBI_THROW(CMyLibException, eNotFound | Info,
+           "Optional resource not present");
+
+// Throw at Warning
+NCBI_THROW(CMyLibException, eParseError | Warning,
+           "Non-critical format deviation");
+```
+
+The available manipulators from `ncbi_ex_manip` namespace:
+
+```cpp
+Info, Warning, Error, Critical, Fatal, Trace
+Console   // Mark for extra-visible display to end users
+Retriable(eRetriable_Yes)  // Hint that the operation can be retried
+```
+
+## Exception Reporting
+
+`NCBI_REPORT_EXCEPTION` logs a `CException` using the default exception reporter, including full backlog:
+
+```cpp
+catch (const CException& ex) {
+    NCBI_REPORT_EXCEPTION("MyFunction context", ex);
+    // Logs: "MyFunction context: <full exception chain>"
+}
+```
+
+For more control, use `CException`'s own reporting methods:
+
+```cpp
+catch (const CException& ex) {
+    // Report only this exception (no backlog)
+    string msg = ex.ReportThis();
+
+    // Report full chain including predecessors
+    string full = ex.ReportAll();
+
+    // Report to an ostream directly
+    ex.ReportStd(NcbiCerr);
+}
+```
+
+## STD_CATCH Variants
+
+For C++ standard exceptions, `STD_CATCH` logs the `what()` message. It pairs naturally after `NCBI_CATCH` or its `_X` variants:
+
+```cpp
+try {
+    SomeOperation();
+}
+catch (const CException& ex) {
+    NCBI_REPORT_EXCEPTION("SomeOperation", ex);
+    return 1;
+}
+STD_CATCH("SomeOperation fallback") // catches std::exception
+catch (...) {
+    ERR_POST(Critical << "Unknown exception type");
+    return 3;
+}
+```
+
+## Complete Example
+
+```cpp
+#include <corelib/ncbiapp.hpp>
+#include <corelib/ncbiexpt.hpp>
+USING_NCBI_SCOPE;
+
+// Define a custom exception class
+class CSeqParseException : public CException
+{
+public:
+    enum EErrCode {
+        eInvalidBase,
+        eUnexpectedEnd,
+        eTooShort
+    };
+
+    virtual const char* GetErrCodeString(void) const override
+    {
+        switch (GetErrCode()) {
+        case eInvalidBase:   return "eInvalidBase";
+        case eUnexpectedEnd: return "eUnexpectedEnd";
+        case eTooShort:      return "eTooShort";
+        default:             return CException::GetErrCodeString();
+        }
+    }
+
+    NCBI_EXCEPTION_DEFAULT(CSeqParseException, CException);
+};
+
+// Function that throws
+string ValidateSequence(const string& seq, size_t minLen)
+{
+    if (seq.size() < minLen) {
+        NCBI_THROW_FMT(CSeqParseException, eTooShort,
+                       "Sequence length " << seq.size()
+                       << " is below minimum " << minLen);
+    }
+    for (char c : seq) {
+        if (string("ACGTNacgtn").find(c) == string::npos) {
+            NCBI_THROW_FMT(CSeqParseException, eInvalidBase,
+                           "Invalid base character: '" << c << "'");
+        }
+    }
+    return seq;
+}
+
+class CMyApp : public CNcbiApplication
+{
+    int Run() override
+    {
+        try {
+            string valid = ValidateSequence("ACGTx", 3);
+            NcbiCout << "Valid: " << valid << NcbiEndl;
+        }
+        catch (const CSeqParseException& ex) {
+            ERR_POST(Error << "Parse error ["
+                           << ex.GetErrCodeString() << "]: "
+                           << ex.GetMsg());
+            return 1;
+        }
+        NCBI_CATCH_ALL("CMyApp::Run")
+
+        return 0;
+    }
+};
+
+int NcbiSys_main(int argc, const char* argv[])
+{
+    return CMyApp().AppMain(argc, argv);
+}
+```
+
+<CardGroup cols={2}>
+  <Card title="Diagnostics and Logging" icon="circle-exclamation" href="/core/diagnostics-and-logging">
+    Understand how NCBI exceptions integrate with ERR_POST and the diagnostic system.
+  </Card>
+  <Card title="Application Framework" icon="rocket" href="/core/application-framework">
+    See how CAppException and CArgException are used by the application framework.
+  </Card>
+</CardGroup>

@@ -1,0 +1,569 @@
+---
+title: "NCBI BLAST C++ Toolkit API Reference"
+description: "Class-level reference for the NCBI BLAST API: CLocalBlast, CBlastOptionsHandle, CSearchDatabase, CSearchResultSet, and remote search via CRemoteBlast."
+---
+
+The BLAST C++ API provides a layered set of classes for constructing, executing, and consuming sequence similarity searches. At the bottom are options-handle classes that configure algorithm parameters; above them sit execution engines (`CLocalBlast`, `CRemoteBlast`) that accept query data and a database descriptor (`CSearchDatabase`) and return structured result containers (`CSearchResultSet`, `CSearchResults`). The `SSeqLoc` struct is the fundamental unit used to pass individual query sequences into the API. All classes live in the `ncbi::blast` namespace unless stated otherwise.
+
+---
+
+<AccordionGroup>
+
+<Accordion title="CBlastOptionsHandle">
+
+Abstract base class (`include/algo/blast/api/blast_options_handle.hpp`) for all BLAST options objects. Subclasses implement program-specific defaults through a template-method pattern; use this type when you need to hold a generic handle independent of the concrete BLAST program.
+
+```cpp
+#include <algo/blast/api/blast_options_handle.hpp>
+using namespace ncbi::blast;
+
+// Construct via the factory for default values:
+CRef<CBlastOptionsHandle> opts(
+    CBlastOptionsFactory::Create(eBlastn));
+
+opts->SetEvalueThreshold(1e-5);
+opts->SetWordSize(11);
+opts->SetFilterString("m L", true);  // low-complexity masking
+opts->Validate();                    // throws CBlastException on error
+```
+
+**Constructor**
+
+<ParamField path="locality" type="EAPILocality">
+  `CBlastOptions::eLocal` (default) or `CBlastOptions::eRemote`. Controls whether option setters that are only meaningful for local execution are active.
+</ParamField>
+
+**Core methods**
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `GetOptions` | `const CBlastOptions& GetOptions() const` | Read-only access to the underlying `CBlastOptions` object for inspecting options not directly exposed by the handle. |
+| `SetOptions` | `CBlastOptions& SetOptions()` | Mutable access. Prefer specific setters—calling this bypasses consistency checks. |
+| `Validate` | `bool Validate() const` | Returns `true` if the option set is self-consistent; throws on invalid combinations. |
+| `GetFilterString` | `char* GetFilterString() const` | Returns the current filter string (caller does not own the pointer). |
+| `SetFilterString` | `void SetFilterString(const char* f, bool clear = true)` | Sets the filter string; when `clear` is `true`, existing filtering options are cleared first. |
+| `GetWordSize` / `SetWordSize` | `int` / `void(int)` | Lookup-table word length. Minimum value depends on program. |
+| `GetEvalueThreshold` / `SetEvalueThreshold` | `double` / `void(double)` | Statistical significance cutoff for reported hits. |
+| `GetHitlistSize` / `SetHitlistSize` | `int` / `void(int)` | Maximum number of database sequences to report per query. |
+| `GetGapOpeningCost` / `SetGapOpeningCost` | `int` / `void(int)` | Gap-open penalty (used by subclasses that expose it). |
+| `GetGapExtensionCost` / `SetGapExtensionCost` | `int` / `void(int)` | Gap-extension penalty. |
+| `GetWindowSize` / `SetWindowSize` | `int` / `void(int)` | Two-hit window size for initial seeding. |
+| `GetGappedMode` / `SetGappedMode` | `bool` / `void(bool)` | Enables or disables the gapped extension phase. |
+| `GetDbLength` / `SetDbLength` | `Int8` / `void(Int8)` | Override the effective database length used for e-value calculations. |
+| `SetDefaults` | `virtual void SetDefaults()` | Resets all options to program defaults. |
+
+</Accordion>
+
+<Accordion title="CBlastNucleotideOptionsHandle">
+
+Concrete subclass (`include/algo/blast/api/blast_nucl_options.hpp`) for nucleotide–nucleotide searches. By default it configures megablast-style defaults; call `SetTraditionalBlastnDefaults()` for blastn behavior.
+
+```cpp
+#include <algo/blast/api/blast_nucl_options.hpp>
+using namespace ncbi::blast;
+
+CBlastNucleotideOptionsHandle opts;
+opts.SetTraditionalBlastnDefaults();
+opts.SetWordSize(11);
+opts.SetMatchReward(1);
+opts.SetMismatchPenalty(-2);
+opts.SetDustFiltering(true);
+opts.SetDustFilteringLevel(20);
+opts.SetDustFilteringWindow(64);
+opts.SetDustFilteringLinker(1);
+opts.SetStrandOption(objects::eNa_strand_both);
+```
+
+**Constructors**
+
+<ParamField path="locality" type="EAPILocality">
+  Locality hint; defaults to `CBlastOptions::eLocal`.
+</ParamField>
+<ParamField path="opt" type="CRef<CBlastOptions>">
+  Wrap an existing `CBlastOptions` object.
+</ParamField>
+
+**Selected additional methods**
+
+| Method | Description |
+|--------|-------------|
+| `GetWordSize` / `SetWordSize(int)` | Seed length (default 28 for megablast, 11 for blastn). |
+| `GetMatchReward` / `SetMatchReward(int)` | Score awarded for a matched nucleotide. |
+| `GetMismatchPenalty` / `SetMismatchPenalty(int)` | Penalty for a mismatched nucleotide. |
+| `GetMatrixName` / `SetMatrixName(const char*)` | Substitution matrix name (unusual for blastn but available). |
+| `GetStrandOption` / `SetStrandOption(ENa_strand)` | Which query strands to search (`eNa_strand_both`, `eNa_strand_plus`, `eNa_strand_minus`). |
+| `GetDustFiltering` / `SetDustFiltering(bool)` | Enable/disable DUST low-complexity filter. |
+| `GetDustFilteringLevel` / `SetDustFilteringLevel(int)` | DUST score threshold (valid: 2–64). |
+| `GetDustFilteringWindow` / `SetDustFilteringWindow(int)` | DUST window size (valid: 8–64). |
+| `GetDustFilteringLinker` / `SetDustFilteringLinker(int)` | Maximum gap at which adjacent masked regions are merged (valid: 1–32). |
+| `GetRepeatFiltering` / `SetRepeatFiltering(bool)` | Enable/disable repeat-element filtering. |
+| `GetWindowMaskerTaxId` / `SetWindowMaskerTaxId(int)` | Select a WindowMasker database by NCBI taxonomy ID (0 to disable). |
+| `GetWindowMaskerDatabase` / `SetWindowMaskerDatabase(const char*)` | Select a WindowMasker database by filename. |
+| `SetTraditionalBlastnDefaults()` | Switch defaults to classic blastn (word size 11, linear gap costs, etc.). |
+| `SetTraditionalMegablastDefaults()` | Switch defaults to megablast (word size 28, greedy extension). |
+| `SetVecScreenDefaults()` | Switch defaults optimized for vector screening. |
+
+</Accordion>
+
+<Accordion title="CBlastAdvancedProteinOptionsHandle">
+
+Concrete subclass (`include/algo/blast/api/blast_advprot_options.hpp`) that extends `CBlastProteinOptionsHandle` with blastp-specific features—composition-based statistics and Smith-Waterman final extension.
+
+```cpp
+#include <algo/blast/api/blast_advprot_options.hpp>
+using namespace ncbi::blast;
+
+CBlastAdvancedProteinOptionsHandle opts;
+opts.SetMatrixName("BLOSUM62");
+opts.SetGapOpeningCost(11);
+opts.SetGapExtensionCost(1);
+opts.SetWordSize(3);
+opts.SetCompositionBasedStats(eCompositionBasedStats);
+opts.SetSmithWatermanMode(false);
+```
+
+**Constructors**
+
+<ParamField path="locality" type="EAPILocality">
+  Locality hint; defaults to `CBlastOptions::eLocal`.
+</ParamField>
+
+**Additional methods**
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `GetCompositionBasedStats` | `ECompoAdjustModes GetCompositionBasedStats() const` | Returns the current composition-adjustment mode. |
+| `SetCompositionBasedStats` | `void SetCompositionBasedStats(ECompoAdjustModes mode)` | Controls whether subject-sequence composition adjusts the e-value. Common values: `eNoCompositionBasedStats`, `eCompositionBasedStats`, `eCompositionMatrixAdjust`. |
+| `GetSmithWatermanMode` | `bool GetSmithWatermanMode() const` | Returns `true` when Smith-Waterman is used for final extensions. |
+| `SetSmithWatermanMode` | `void SetSmithWatermanMode(bool m = false)` | When `true`, replaces the heuristic extension with exact Smith-Waterman; increases sensitivity at the cost of speed. |
+
+Inherits all protein options from `CBlastProteinOptionsHandle` including `GetMatrixName`, `SetSegFiltering`, `GetWordThreshold`, and gap cost setters.
+
+</Accordion>
+
+<Accordion title="CLocalBlast">
+
+`CLocalBlast` (`include/algo/blast/api/local_blast.hpp`) orchestrates a complete BLAST search against a local BLAST database or a set of in-memory sequences. It wraps the preliminary (seeding) and traceback stages internally.
+
+```cpp
+#include <algo/blast/api/local_blast.hpp>
+#include <algo/blast/api/blast_nucl_options.hpp>
+#include <algo/blast/api/sseqloc.hpp>
+#include <algo/blast/api/uniform_search.hpp>
+#include <algo/blast/api/objmgr_query_data.hpp>
+
+using namespace ncbi;
+using namespace ncbi::blast;
+
+// Build query
+CRef<objects::CObjectManager> objmgr = objects::CObjectManager::GetInstance();
+CRef<objects::CScope> scope(new objects::CScope(*objmgr));
+scope->AddDefaults();
+
+// Wrap sequence location
+SSeqLoc query_seqloc(my_seq_loc, *scope);
+TSeqLocVector query_vec(1, query_seqloc);
+CRef<IQueryFactory> query_factory(new CObjMgr_QueryFactory(query_vec));
+
+// Configure options
+CRef<CBlastNucleotideOptionsHandle> opts(new CBlastNucleotideOptionsHandle);
+opts->SetTraditionalBlastnDefaults();
+opts->SetEvalueThreshold(1e-10);
+
+// Describe database
+CSearchDatabase db("nt", CSearchDatabase::eBlastDbIsNucleotide);
+
+// Run search
+CLocalBlast blaster(query_factory, opts, db);
+CRef<CSearchResultSet> results = blaster.Run();
+
+// Examine results
+for (size_t i = 0; i < results->size(); ++i) {
+    const CSearchResults& res = (*results)[i];
+    if (!res.HasErrors() && res.HasAlignments()) {
+        CConstRef<objects::CSeq_align_set> aligns = res.GetSeqAlign();
+        // process aligns ...
+    }
+}
+```
+
+**Constructors**
+
+<ParamField path="query_factory" type="CRef<IQueryFactory>">
+  Source of query sequence data. Typically a `CObjMgr_QueryFactory` wrapping a `TSeqLocVector`.
+</ParamField>
+<ParamField path="opts_handle" type="CRef<CBlastOptionsHandle>">
+  Configured options for the search (e.g., `CBlastNucleotideOptionsHandle`).
+</ParamField>
+<ParamField path="dbinfo" type="const CSearchDatabase&">
+  Descriptor for the local BLAST database to search.
+</ParamField>
+
+An overload accepting `CRef<CLocalDbAdapter>` is available for searching in-memory subject sequences.
+
+**Methods**
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `Run` | `CRef<CSearchResultSet> Run()` | Executes the search synchronously and returns all results. |
+| `GetSearchMessages` | `TSearchMessages GetSearchMessages() const` | Returns any warning or error messages generated during the search (non-fatal conditions). |
+| `GetNumExtensions` | `Int4 GetNumExtensions()` | Returns the total number of alignment extensions performed; useful for profiling. |
+| `SetInterruptCallback` | `TInterruptFnPtr SetInterruptCallback(TInterruptFnPtr, void*)` | Installs a callback invoked periodically; return `true` from the callback to abort the search early. |
+
+</Accordion>
+
+<Accordion title="CRemoteBlast">
+
+`CRemoteBlast` (`include/algo/blast/api/remote_blast.hpp`) submits a BLAST search to NCBI's remote BLAST servers via the BLAST 4 protocol. It supports synchronous polling (`SubmitSync`) as well as asynchronous submission and manual polling (`Submit`, `CheckDone`).
+
+```cpp
+#include <algo/blast/api/remote_blast.hpp>
+#include <algo/blast/api/blast_nucl_options.hpp>
+using namespace ncbi;
+using namespace ncbi::blast;
+
+// Create options and configure
+CRef<CBlastNucleotideOptionsHandle> opts(new CBlastNucleotideOptionsHandle);
+opts->SetTraditionalBlastnDefaults();
+opts->SetEvalueThreshold(0.001);
+
+// Build query factory and database
+CRef<IQueryFactory> queries(new CObjMgr_QueryFactory(query_vec));
+CSearchDatabase db("nt", CSearchDatabase::eBlastDbIsNucleotide);
+
+// Submit and wait
+CRemoteBlast remote_blast(queries, opts, db);
+bool submitted = remote_blast.SubmitSync();  // blocks until done or timeout
+
+if (submitted) {
+    string rid = remote_blast.GetRID();
+    CRef<CSearchResultSet> results = remote_blast.GetResultSet();
+}
+```
+
+**Constructors**
+
+<ParamField path="RID" type="const string&">
+  Resume a previously submitted search by its Request ID.
+</ParamField>
+<ParamField path="queries" type="CRef<IQueryFactory>">
+  Query sequences for a new search.
+</ParamField>
+<ParamField path="opts_handle" type="CRef<CBlastOptionsHandle>">
+  Options handle for the new search.
+</ParamField>
+<ParamField path="db" type="const CSearchDatabase&">
+  Target database for the new search.
+</ParamField>
+
+**Methods**
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `SetDatabase` | `void SetDatabase(const string& x)` | Override the target database name after construction. |
+| `SetQueries` | `void SetQueries(TSeqLocList&)` | Set queries as a list of `CSeq_loc` references. |
+| `SubmitSync` | `bool SubmitSync(void)` | Submit (if not already submitted) and block until the search completes or times out (default ~3.5 hours). Returns `true` on success. |
+| `SubmitSync` | `bool SubmitSync(int timeout)` | Overload with explicit timeout in seconds. |
+| `Submit` | `bool Submit(void)` | Submit the search and return immediately; poll manually with `CheckDone`. |
+| `CheckDone` | `bool CheckDone(void)` | Poll the server once; returns `true` when results are available (or an error occurred). Wait at least 10 seconds between calls. |
+| `GetResultSet` | `CRef<CSearchResultSet> GetResultSet()` | Retrieve the full result set; internally calls `SubmitSync` if not already done. |
+| `GetRID` | `const string& GetRID(void)` | Returns the Request ID assigned by the NCBI server. |
+| `GetErrors` | `string GetErrors(void)` | Returns a newline-separated string of any errors; empty on success. |
+| `GetWarnings` | `string GetWarnings(void)` | Returns any non-fatal warnings. |
+| `CheckStatus` | `ESearchStatus CheckStatus()` | Returns `eStatus_Done`, `eStatus_Pending`, `eStatus_Failed`, or `eStatus_Unknown`. |
+
+</Accordion>
+
+<Accordion title="CSearchDatabase">
+
+Describes the subject database for a BLAST search (`include/algo/blast/api/uniform_search.hpp`). Used by both `CLocalBlast` and `CRemoteBlast`.
+
+```cpp
+#include <algo/blast/api/uniform_search.hpp>
+using namespace ncbi::blast;
+
+// Nucleotide database
+CSearchDatabase nucl_db("nt", CSearchDatabase::eBlastDbIsNucleotide);
+
+// Protein database with an Entrez query filter
+CSearchDatabase prot_db("nr",
+                        CSearchDatabase::eBlastDbIsProtein,
+                        "Homo sapiens[Organism]");
+
+string name = nucl_db.GetDatabaseName();  // "nt"
+bool is_prot = prot_db.IsProtein();       // true
+```
+
+**Constructors**
+
+<ParamField path="dbname" type="const string&">
+  BLAST database name (e.g., `"nt"`, `"nr"`, or a local path).
+</ParamField>
+<ParamField path="mol_type" type="EMoleculeType">
+  `eBlastDbIsProtein` or `eBlastDbIsNucleotide`.
+</ParamField>
+<ParamField path="entrez_query" type="const string&">
+  Optional Entrez query to restrict which database sequences are searched.
+</ParamField>
+
+**Methods**
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `GetDatabaseName` | `string GetDatabaseName() const` | Returns the database name as given to the constructor. |
+| `SetDatabaseName` | `void SetDatabaseName(const string&)` | Change the database name after construction. |
+| `GetMoleculeType` | `EMoleculeType GetMoleculeType() const` | Returns the molecule type enum. |
+| `IsProtein` | `bool IsProtein() const` | Convenience: returns `true` when the molecule type is protein. |
+| `SetGiList` | `void SetGiList(CSeqDBGiList*)` | Restrict the search to the specified list of GIs. |
+| `SetNegativeGiList` | `void SetNegativeGiList(CSeqDBGiList*)` | Exclude the specified GIs from the search. |
+| `SetEntrezQueryLimitation` | `void SetEntrezQueryLimitation(const string&)` | Apply an Entrez query filter to restrict subjects. |
+| `SetFilteringAlgorithm` | `void SetFilteringAlgorithm(int id, ESubjectMaskingType)` | Apply a pre-computed masking algorithm from the database. |
+| `SetSeqDb` | `void SetSeqDb(CRef<CSeqDB>)` | Provide an already-opened `CSeqDB` handle for reuse across multiple searches. |
+
+</Accordion>
+
+<Accordion title="CSearchResultSet">
+
+Container holding all search results from a single BLAST run (`include/algo/blast/api/blast_results.hpp`). For database searches it contains one `CSearchResults` per query; for sequence-comparison (Bl2seq) searches it contains one entry per query-subject pair.
+
+```cpp
+CRef<CSearchResultSet> results = blaster.Run();
+
+std::cout << "Queries: " << results->GetNumQueries() << "\n";
+std::cout << "Result entries: " << results->size() << "\n";
+
+// Integer index access
+const CSearchResults& r0 = (*results)[0];
+
+// Range-based iteration
+for (const auto& result_ref : *results) {
+    const CSearchResults& r = *result_ref;
+    if (r.HasErrors()) {
+        std::cerr << r.GetErrorStrings() << "\n";
+    }
+}
+
+// Seq-id-based lookup (database searches only)
+CRef<CSearchResults> r_by_id = (*results)[*query_seq_id];
+```
+
+**Methods**
+
+<ResponseField name="operator[](size_type i)" type="CSearchResults&">
+  Returns the result entry at position `i` by reference. For database searches, `i` is the query index.
+</ResponseField>
+
+<ResponseField name="operator[](const CSeq_id&)" type="CRef<CSearchResults>">
+  Returns the result for the given query identifier. Only valid for `eDatabaseSearch` result sets.
+</ResponseField>
+
+<ResponseField name="GetNumResults() / size()" type="size_type">
+  Number of entries in the container. For database searches this equals the number of queries; for Bl2seq it equals (queries × subjects).
+</ResponseField>
+
+<ResponseField name="GetNumQueries()" type="size_type">
+  Number of distinct query sequences, independent of the number of subjects.
+</ResponseField>
+
+<ResponseField name="empty()" type="bool">
+  Returns `true` when the container holds no results.
+</ResponseField>
+
+<ResponseField name="begin() / end()" type="iterator / const_iterator">
+  STL-style iterators over `CRef<CSearchResults>` elements.
+</ResponseField>
+
+</Accordion>
+
+<Accordion title="CSearchResults">
+
+Holds all search data for a single query sequence (`include/algo/blast/api/blast_results.hpp`): alignment set, error/warning messages, masked regions, and statistical ancillary data.
+
+```cpp
+const CSearchResults& result = (*results)[0];
+
+if (result.HasErrors()) {
+    std::cerr << result.GetErrorStrings() << "\n";
+}
+
+if (result.HasAlignments()) {
+    CConstRef<objects::CSeq_align_set> aligns = result.GetSeqAlign();
+    ITERATE(objects::CSeq_align_set::Tdata, it, aligns->Get()) {
+        // process each CSeq_align ...
+    }
+}
+
+// For remote results, the server-assigned RID:
+std::string rid = result.GetRID();
+```
+
+**Methods**
+
+<ResponseField name="GetSeqAlign()" type="CConstRef<CSeq_align_set>">
+  Returns the alignment set. Returns a null ref if there were no hits.
+</ResponseField>
+
+<ResponseField name="HasAlignments()" type="bool">
+  Returns `true` when the alignment set is non-null and non-empty.
+</ResponseField>
+
+<ResponseField name="GetErrors(int min_severity)" type="TQueryMessages">
+  Returns error and warning messages at or above `min_severity` (default `eBlastSevError`).
+</ResponseField>
+
+<ResponseField name="HasErrors()" type="bool">
+  Returns `true` if any error-level messages are present.
+</ResponseField>
+
+<ResponseField name="HasWarnings()" type="bool">
+  Returns `true` if any warning-level messages are present.
+</ResponseField>
+
+<ResponseField name="GetRID()" type="string">
+  Returns the NCBI Request ID associated with these results; empty for local searches.
+</ResponseField>
+
+<ResponseField name="GetSeqId()" type="CConstRef<CSeq_id>">
+  Returns the query's sequence identifier.
+</ResponseField>
+
+<ResponseField name="GetAncillaryData()" type="CRef<CBlastAncillaryData>">
+  Returns statistical parameters (Karlin-Altschul lambda, K, H; effective search space) for this query.
+</ResponseField>
+
+<ResponseField name="GetErrorStrings()" type="string">
+  Human-readable error summary prefixed with the query identifier.
+</ResponseField>
+
+</Accordion>
+
+<Accordion title="SSeqLoc">
+
+Lightweight struct (`include/algo/blast/api/sseqloc.hpp`) pairing a `CSeq_loc` with its owning `CScope`. This is the fundamental unit used to describe a query or subject sequence to the BLAST API.
+
+```cpp
+#include <algo/blast/api/sseqloc.hpp>
+using namespace ncbi;
+using namespace ncbi::blast;
+
+// Whole-sequence query (no masking)
+SSeqLoc query(&seq_loc, &scope);
+
+// With a pre-computed mask
+SSeqLoc masked_query(&seq_loc, &scope, &mask_loc, /*ignore_strand=*/true);
+
+// Collect into a vector for use with CObjMgr_QueryFactory
+TSeqLocVector queries;
+queries.push_back(query);
+```
+
+**Fields**
+
+<ResponseField name="seqloc" type="CConstRef<CSeq_loc>">
+  The sequence region to be used as query or subject. Must be of type `whole` or `seq-interval`.
+</ResponseField>
+
+<ResponseField name="scope" type="CRef<CScope>">
+  The Object Manager scope through which the sequence data can be retrieved.
+</ResponseField>
+
+<ResponseField name="mask" type="CRef<CSeq_loc>">
+  Optional masking locations applied to `seqloc` before seeding the lookup table. Acceptable types: `seq-interval` and `packed-int`.
+</ResponseField>
+
+<ResponseField name="ignore_strand_in_mask" type="bool">
+  When `true` (default), the strand specification of `mask` is ignored and masking applies to both strands.
+</ResponseField>
+
+<ResponseField name="genetic_code_id" type="Uint4">
+  Genetic code to use when translating the sequence (for blastx/tblastn). Defaults to `BLAST_GENETIC_CODE` (standard code 1).
+</ResponseField>
+
+</Accordion>
+
+</AccordionGroup>
+
+---
+
+## Full blastn Search Example
+
+The following example demonstrates a complete local nucleotide BLAST search from sequence loading to alignment traversal.
+
+```cpp
+#include <objmgr/object_manager.hpp>
+#include <objmgr/scope.hpp>
+#include <objects/seqloc/Seq_loc.hpp>
+
+#include <algo/blast/api/local_blast.hpp>
+#include <algo/blast/api/blast_nucl_options.hpp>
+#include <algo/blast/api/sseqloc.hpp>
+#include <algo/blast/api/objmgr_query_data.hpp>
+#include <algo/blast/api/uniform_search.hpp>
+#include <algo/blast/api/blast_results.hpp>
+
+USING_NCBI_SCOPE;
+USING_SCOPE(blast);
+USING_SCOPE(objects);
+
+int main()
+{
+    // 1. Set up Object Manager and scope
+    CRef<CObjectManager> objmgr = CObjectManager::GetInstance();
+    CGBDataLoader::RegisterInObjectManager(*objmgr);  // GenBank loader
+    CRef<CScope> scope(new CScope(*objmgr));
+    scope->AddDefaults();
+
+    // 2. Build a query from a known accession
+    CRef<CSeq_loc> query_loc(new CSeq_loc);
+    query_loc->SetWhole().SetAccver("NM_001301717.2");
+
+    SSeqLoc query_seqloc(*query_loc, *scope);
+    TSeqLocVector query_vec(1, query_seqloc);
+    CRef<IQueryFactory> query_factory(
+        new CObjMgr_QueryFactory(query_vec));
+
+    // 3. Configure options for blastn
+    CRef<CBlastNucleotideOptionsHandle> opts(
+        new CBlastNucleotideOptionsHandle);
+    opts->SetTraditionalBlastnDefaults();
+    opts->SetWordSize(11);
+    opts->SetEvalueThreshold(1e-10);
+    opts->SetHitlistSize(50);
+    opts->SetDustFiltering(true);
+    opts->Validate();
+
+    // 4. Describe the database
+    CSearchDatabase db("nt",
+        CSearchDatabase::eBlastDbIsNucleotide);
+
+    // 5. Run the search
+    CLocalBlast blaster(query_factory, opts, db);
+    CRef<CSearchResultSet> results = blaster.Run();
+
+    // 6. Process results
+    const CSearchResults& res = (*results)[0];
+    if (res.HasErrors()) {
+        cerr << "Search errors: " << res.GetErrorStrings() << "\n";
+        return 1;
+    }
+
+    if (!res.HasAlignments()) {
+        cout << "No hits found.\n";
+        return 0;
+    }
+
+    CConstRef<CSeq_align_set> aligns = res.GetSeqAlign();
+    cout << "Hits for query: "
+         << res.GetSeqId()->GetSeqIdString() << "\n";
+
+    size_t rank = 1;
+    ITERATE(CSeq_align_set::Tdata, it, aligns->Get()) {
+        const CSeq_align& aln = **it;
+        cout << "  [" << rank++ << "] "
+             << aln.GetSeq_id(1).GetSeqIdString()
+             << " score=" << aln.GetScore("score") << "\n";
+    }
+
+    return 0;
+}
+```

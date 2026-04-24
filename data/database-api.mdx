@@ -1,0 +1,324 @@
+---
+title: "DBAPI: Relational Database Access in the C++ Toolkit"
+description: "How to connect to Sybase, MS SQL, FreeTDS, ODBC, and SQLite databases using the NCBI DBAPI interfaces and the higher-level SDBAPI wrapper classes."
+---
+
+NCBI DBAPI is a database-agnostic interface layer that provides consistent access to Sybase, Microsoft SQL Server, FreeTDS, ODBC, and SQLite backends through a uniform set of C++ abstract interfaces. Application code written against `IConnection`, `IStatement`, and `IResultSet` requires no changes when switching backends. For common use cases the simpler `CDatabase` / `CQuery` wrappers from SDBAPI (Simple DBAPI) reduce boilerplate significantly.
+
+## Interface hierarchy
+
+The core DBAPI API consists of pure-virtual interfaces:
+
+<CardGroup cols={2}>
+  <Card title="IDataSource" icon="server">
+    Represents a backend driver instance. Created by `CDriverManager::CreateDs()`. Factory for `IConnection` objects.
+  </Card>
+  <Card title="IConnection" icon="plug">
+    An open database connection. Factory for `IStatement`, `ICallableStatement`, `ICursor`, and `IBulkInsert`.
+  </Card>
+  <Card title="IStatement" icon="code">
+    Executes SQL. Methods: `Execute()`, `ExecuteQuery()`, `ExecuteUpdate()`, `GetResultSet()`, `HasMoreResults()`.
+  </Card>
+  <Card title="IResultSet" icon="table">
+    Iterates rows. Methods: `Next()`, `GetVariant(col)`, `GetTotalColumns()`, `GetMetaData()`.
+  </Card>
+</CardGroup>
+
+## Supported backends
+
+| Driver name | Backend |
+|-------------|---------|
+| `ctlib` | Sybase and Microsoft SQL Server (native) |
+| `ftds` | FreeTDS (open-source TDS implementation) |
+| `odbc` | Any ODBC-compatible source |
+| `sqlite3` | SQLite embedded database |
+
+<Note>
+Within NCBI infrastructure, the `ftds` (FreeTDS) driver with the FTDS14 protocol is the recommended default for connecting to MS SQL servers.
+</Note>
+
+## Basic DBAPI workflow
+
+<Steps>
+  <Step title="Register the driver and get a data source">
+    Load the backend driver and create an `IDataSource`. The driver manager is a singleton; drivers are loaded as shared libraries by name.
+
+    ```cpp
+    #include <dbapi/dbapi.hpp>
+    #include <dbapi/driver_mgr.hpp>
+
+    USING_SCOPE(ncbi);
+
+    // Load the FreeTDS driver
+    IDataSource* ds = CDriverManager::CreateDs("ftds");
+
+    // Optional: set login timeout
+    ds->SetLoginTimeout(15);
+    ```
+  </Step>
+
+  <Step title="Open a connection">
+    Create an `IConnection` and connect with credentials.
+
+    ```cpp
+    // IConnection is owned by ds unless eTakeOwnership is specified
+    unique_ptr<IConnection> conn(ds->CreateConnection(eTakeOwnership));
+
+    conn->Connect(
+        "myuser",            // username
+        "mypassword",        // password
+        "my_sql_server",     // server / host name
+        "my_database"        // initial database (optional)
+    );
+    ```
+  </Step>
+
+  <Step title="Execute a query">
+    Create an `IStatement` and run SQL.
+
+    ```cpp
+    unique_ptr<IStatement> stmt(conn->CreateStatement());
+
+    // ExecuteQuery returns the first result set and keeps others pending
+    IResultSet* rs = stmt->ExecuteQuery(
+        "SELECT accession, taxid, length FROM sequences WHERE taxid = 9606"
+    );
+    ```
+  </Step>
+
+  <Step title="Read results">
+    Call `Next()` to advance to each row, then retrieve columns by position (1-based) or name.
+
+    ```cpp
+    while (rs->Next()) {
+        string accession = rs->GetVariant(1).GetString();
+        int    taxid     = rs->GetVariant(2).GetInt4();
+        int    length    = rs->GetVariant(3).GetInt4();
+
+        NcbiCout << accession << "\t" << taxid << "\t" << length << NcbiEndl;
+    }
+    // Discard any remaining result sets
+    stmt->PurgeResults();
+    ```
+  </Step>
+
+  <Step title="Clean up">
+    Statements and connections are cleaned up when `unique_ptr` goes out of scope. For raw pointers, call `Close()` then `delete`.
+
+    ```cpp
+    stmt->Close();
+    conn->Close();
+    // ds is owned and destroyed by CDriverManager
+    ```
+  </Step>
+</Steps>
+
+## Parameterized queries and prepared statements
+
+Use `SetParam()` to bind parameters before executing. Parameters are named with a `@` prefix by convention on Sybase/MS SQL:
+
+```cpp
+stmt->SetParam(CVariant("Homo sapiens"), "@organism");
+stmt->SetParam(CVariant(9606),           "@taxid");
+
+stmt->Execute(
+    "SELECT accession FROM sequences "
+    "WHERE organism = @organism AND taxid = @taxid"
+);
+
+while (stmt->HasMoreResults()) {
+    IResultSet* rs = stmt->GetResultSet();
+    if (!rs) continue;
+    while (rs->Next()) {
+        NcbiCout << rs->GetVariant(1).GetString() << NcbiEndl;
+    }
+}
+stmt->PurgeResults();
+stmt->ClearParamList();
+```
+
+<Tip>
+Call `ExecuteLast()` to re-execute the same statement with changed parameter values without reparsing the SQL text.
+</Tip>
+
+## Cursor support
+
+Cursors allow server-side scrolling and positioned updates on the result set.
+
+```cpp
+// Open a cursor with batch size 10
+unique_ptr<ICursor> cursor(
+    conn->CreateCursor("my_cursor",
+                       "SELECT id, data FROM blobs WHERE ready = 1",
+                       10)
+);
+
+IResultSet* crs = cursor->Open();
+while (crs->Next()) {
+    int    id   = crs->GetVariant(1).GetInt4();
+    string data = crs->GetVariant(2).GetString();
+
+    // Positioned update using the cursor
+    cursor->Update("blobs", "SET ready = 0");
+}
+cursor->Close();
+```
+
+## Stored procedure calls
+
+Use `ICallableStatement` for stored procedures. Output parameters are retrieved after the call completes.
+
+```cpp
+unique_ptr<ICallableStatement> proc(
+    conn->PrepareCall("get_sequence_by_gi")
+);
+
+proc->SetParam(CVariant(GI_CONST(12345678)), "@gi");
+
+// Declare an output parameter
+proc->SetOutputParam(CVariant(eDB_VarChar), "@accession");
+
+proc->Execute();
+proc->PurgeResults();
+
+// Read output parameter
+string acc = proc->GetVariant("@accession").GetString();
+NcbiCout << "Accession: " << acc << NcbiEndl;
+```
+
+## SDBAPI: simpler connection management
+
+The Simple DBAPI wrapper (`include/dbapi/simple/sdbapi.hpp`) provides `CDatabase` and `CQuery`, which hide connection pooling, parameter binding, and result iteration behind a more ergonomic API.
+
+### Connecting with CDatabase
+
+```cpp
+#include <dbapi/simple/sdbapi.hpp>
+
+USING_SCOPE(ncbi);
+
+// URL format: dbapi://user:pass@server/database
+CDatabase db("dbapi://myuser:mypassword@my_sql_server/my_database");
+db.Connect();
+```
+
+Or use `CSDB_ConnectionParam` to configure in code:
+
+```cpp
+CSDB_ConnectionParam params;
+params.Set(CSDB_ConnectionParam::eService,  "my_sql_server");
+params.Set(CSDB_ConnectionParam::eUserName, "myuser");
+params.Set(CSDB_ConnectionParam::ePassword, "mypassword");
+params.Set(CSDB_ConnectionParam::eDatabase, "my_database");
+
+CDatabase db(params);
+db.Connect();
+```
+
+### Querying with CQuery
+
+```cpp
+CQuery q = db.NewQuery("SELECT accession, length FROM sequences WHERE taxid = @taxid");
+q.SetParameter("@taxid", 9606);
+q.Execute();
+
+for (const auto& row : q.SingleSet()) {
+    NcbiCout << row["accession"].AsString() << "\t"
+             << row["length"].AsInt4()      << NcbiEndl;
+}
+```
+
+### Transactions
+
+Use the `SDBAPI_TRANSACTION` macro for automatic commit/rollback:
+
+```cpp
+SDBAPI_TRANSACTION(db) {
+    CQuery insert = db.NewQuery(
+        "INSERT INTO sequences (accession, length) VALUES (@acc, @len)"
+    );
+    insert.SetParameter("@acc", string("NM_001234"));
+    insert.SetParameter("@len", 4321);
+    insert.Execute();
+    // automatically COMMITs at end of block; ROLLBACKs on exception
+}
+```
+
+## Bulk insert
+
+`IBulkInsert` (DBAPI) and `CBulkInsert` (SDBAPI) provide high-throughput row insertion without executing individual `INSERT` statements for each row.
+
+### SDBAPI bulk insert
+
+```cpp
+CBulkInsert bi = db.NewBulkInsert("staging_table", /*autoflush=*/1000);
+
+bi.Bind(1, eSDB_String); // accession column
+bi.Bind(2, eSDB_Int4);   // length column
+
+bi << string("NM_001234") << 4321 << EndRow;
+bi << string("NM_005678") << 2100 << EndRow;
+
+bi.Complete(); // flush remaining rows and close the session
+```
+
+## Complete example (SDBAPI)
+
+```cpp
+#include <dbapi/simple/sdbapi.hpp>
+#include <corelib/ncbiapp.hpp>
+
+USING_SCOPE(ncbi);
+
+int main(int argc, const char* argv[])
+{
+    // Initialize SDBAPI (sets up connection pools from config if any)
+    CSDBAPI::Init();
+
+    CDatabase db("dbapi://myuser:mypassword@my_sql_server/GenomicDB");
+    db.Connect();
+
+    // Parameterized query
+    CQuery q = db.NewQuery(
+        "SELECT top 10 accession, taxid, length "
+        "FROM sequences "
+        "WHERE mol_type = @mol AND length > @min_len "
+        "ORDER BY length DESC"
+    );
+    q.SetParameter("@mol",     string("mRNA"));
+    q.SetParameter("@min_len", 10000);
+    q.Execute();
+
+    NcbiCout << "accession\ttaxid\tlength\n";
+    for (const auto& row : q.SingleSet()) {
+        NcbiCout
+            << row["accession"].AsString() << "\t"
+            << row["taxid"].AsInt4()       << "\t"
+            << row["length"].AsInt4()      << "\n";
+    }
+
+    db.Close();
+    return 0;
+}
+```
+
+<Warning>
+`IResultSet*` pointers returned by `IStatement::GetResultSet()` or `IStatement::ExecuteQuery()` are owned by the statement. Do not delete them, and do not use them after the statement is closed or after `PurgeResults()` is called.
+</Warning>
+
+## Error handling
+
+Both DBAPI and SDBAPI throw exceptions on errors. SDBAPI throws `CSDB_Exception`; DBAPI throws `CDB_Exception` or one of its subclasses. Catch at an appropriate level:
+
+```cpp
+try {
+    CQuery q = db.NewQuery("SELECT * FROM nonexistent_table");
+    q.Execute();
+} catch (const CSDB_Exception& e) {
+    ERR_POST("Database error: " << e.what());
+    ERR_POST("Server: "   << e.GetServerName());
+    ERR_POST("Database: " << e.GetDatabaseName());
+} catch (const CException& e) {
+    ERR_POST("NCBI exception: " << e.what());
+}
+```

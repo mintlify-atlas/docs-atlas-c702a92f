@@ -1,0 +1,681 @@
+---
+title: "Sequence Algorithm Classes — NCBI C++ Toolkit"
+description: "API reference for masking, spliced alignment, pairwise alignment, and alignment-utility classes in the NCBI C++ Toolkit algo module."
+---
+
+The NCBI C++ Toolkit `algo` module provides production-quality implementations of several core sequence-analysis algorithms. The masking subsystem covers symmetric DUST (`CSymDustMasker`) for low-complexity nucleotide masking and WindowMasker (`CSeqMasker`) for statistics-based repeat masking. The alignment subsystem covers banded Needleman-Wunsch pairwise alignment (`CBandAligner`), spliced cDNA-to-genomic alignment (`CSplign`), and post-processing utilities including `CAlignCleanup`, `CAlignCompare`, and `CScoreBuilder`. All classes are in the `ncbi` namespace unless otherwise noted.
+
+---
+
+<AccordionGroup>
+
+## Masking
+
+<Accordion title="CSymDustMasker">
+
+Implements the symmetric DUST algorithm for identifying low-complexity regions in nucleotide sequences (`include/algo/dustmask/symdust.hpp`). Returns a list of coordinate intervals to mask. Operates as a function object—construct once and call repeatedly on different sequences.
+
+```cpp
+#include <algo/dustmask/symdust.hpp>
+#include <objmgr/seq_vector.hpp>
+USING_NCBI_SCOPE;
+
+// Construct with default parameters
+CSymDustMasker masker;          // level=20, window=64, linker=1
+
+// Or specify parameters explicitly
+CSymDustMasker masker2(
+    20,   // level  (score threshold)
+    64,   // window (max window size)
+    1     // linker (max merge gap)
+);
+
+// Mask a sequence
+// seq is a CSeqVector obtained from the Object Manager
+std::unique_ptr<CSymDustMasker::TMaskList> masks = masker(seq);
+
+for (const auto& interval : *masks) {
+    cout << "Masked: [" << interval.first
+         << ", " << interval.second << "]\n";
+}
+
+// Mask a subsequence
+auto submasks = masker(seq, /*start=*/100, /*stop=*/500);
+```
+
+**Constructor**
+
+<ParamField path="level" type="Uint4">
+  Score threshold above which a region is considered low-complexity. Valid range roughly 2–64; default is `20` (`DEFAULT_LEVEL`).
+</ParamField>
+<ParamField path="window" type="size_type">
+  Maximum sliding-window size in bases. Default is `64` (`DEFAULT_WINDOW`).
+</ParamField>
+<ParamField path="linker" type="size_type">
+  Maximum gap at which adjacent masked intervals are merged into one. Default is `1` (`DEFAULT_LINKER`).
+</ParamField>
+
+**`operator()`**
+
+<ResponseField name="operator()(const sequence_type& seq)" type="std::unique_ptr<TMaskList>">
+  Masks the entire sequence. Returns a heap-allocated list of `(start, stop)` pairs representing masked intervals (0-based, inclusive).
+</ResponseField>
+
+<ResponseField name="operator()(const sequence_type& seq, size_type start, size_type stop)" type="std::unique_ptr<TMaskList>">
+  Masks only the subsequence `[start, stop]`. Coordinates in the returned intervals are relative to the full sequence.
+</ResponseField>
+
+**Utility methods**
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `GetMaskedLocs` | `void GetMaskedLocs(CSeq_id&, const sequence_type&, vector<CConstRef<CSeq_loc>>&)` | Populates a vector of `CSeq_loc` objects instead of raw intervals. |
+| `GetMaskedInts` | `CRef<CPacked_seqint> GetMaskedInts(CSeq_id&, const sequence_type&)` | Returns masked regions as an ASN.1 `CPacked_seqint` object. |
+
+**Type aliases**
+
+| Type | Definition |
+|------|-----------|
+| `sequence_type` | `objects::CSeqVector` |
+| `TMaskedInterval` | `std::pair<size_type, size_type>` |
+| `TMaskList` | `std::vector<TMaskedInterval>` |
+
+**Default constants**
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `DEFAULT_LEVEL` | 20 | Score threshold |
+| `DEFAULT_WINDOW` | 64 | Max window size (bases) |
+| `DEFAULT_LINKER` | 1 | Max merge gap |
+
+</Accordion>
+
+<Accordion title="CSeqMasker (WindowMasker)">
+
+Statistics-driven repeat masker implementing the WindowMasker algorithm (`include/algo/winmask/seq_masker.hpp`). Requires a pre-built unit-score statistics file (created by `win_mask_gen_counts`). Operates as a function object returning a pointer to a `TMaskList`.
+
+```cpp
+#include <algo/winmask/seq_masker.hpp>
+#include <objmgr/seq_vector.hpp>
+USING_NCBI_SCOPE;
+
+CSeqMasker masker(
+    "wm_counts.obinary", // lstat_name: statistics file
+    16,    // window_size in bp
+    1,     // window_step
+    1,     // unit_step
+    30,    // textend: score above which to extend masking
+    50,    // cutoff_score: unit score that triggers masking
+    50,    // max_score
+    2,     // min_score
+    50,    // set_max_score (clamped value for units > max)
+    2,     // set_min_score (clamped value for units < min)
+    false, // merge_pass: perform interval-merging pass
+    50,    // merge_cutoff_score
+    8,     // abs_merge_cutoff_dist
+    24,    // mean_merge_cutoff_dist
+    1,     // merge_unit_step
+    "mean",// trigger: "mean" or "min"
+    0,     // tmin_count (only used when trigger == "min")
+    false, // discontig: use discontiguous units
+    0,     // pattern (for discontiguous units)
+    true   // use_ba: use bit-array optimization when available
+);
+
+const objects::CSeqVector& data = /* from Object Manager */;
+CSeqMasker::TMaskList* masks = masker(data);
+
+for (const auto& interval : *masks) {
+    cout << "Masked: [" << interval.first
+         << ", " << interval.second << "]\n";
+}
+delete masks;  // caller owns the returned pointer
+```
+
+**Constructor parameters (key subset)**
+
+<ParamField path="lstat_name" type="const string&">
+  Path to the pre-built unit-score statistics file (`.obinary` or `.oascii` format).
+</ParamField>
+<ParamField path="arg_window_size" type="Uint1">
+  Window size in base pairs.
+</ParamField>
+<ParamField path="arg_cutoff_score" type="Uint4">
+  Unit score at or above which a window is eligible for masking.
+</ParamField>
+<ParamField path="arg_textend" type="Uint4">
+  Score above which masking may continue to extend into adjacent windows.
+</ParamField>
+<ParamField path="arg_trigger" type="const string&">
+  Masking trigger method: `"mean"` (default) uses the mean unit score within a window; `"min"` uses the k-th lowest score.
+</ParamField>
+<ParamField path="arg_merge_pass" type="bool">
+  When `true`, performs a second pass to merge closely spaced masked intervals.
+</ParamField>
+<ParamField path="arg_discontig" type="bool">
+  When `true`, uses discontiguous units defined by `arg_pattern` (an integer bit-pattern).
+</ParamField>
+
+**`operator()`**
+
+<ResponseField name="operator()(const CSeqVector& data)" type="TMaskList*">
+  Masks the sequence and returns a heap-allocated `TMaskList`. The caller is responsible for deleting the returned pointer.
+</ResponseField>
+
+**Static utility**
+
+| Method | Description |
+|--------|-------------|
+| `MergeMaskInfo(TMaskList* dest, const TMaskList* src)` | Merges two mask lists in-place (e.g., to combine DUST and WindowMasker results). |
+
+</Accordion>
+
+</AccordionGroup>
+
+---
+
+<AccordionGroup>
+
+## Alignment
+
+<Accordion title="CBandAligner">
+
+Banded global (Needleman-Wunsch) alignment (`include/algo/align/nw/nw_band_aligner.hpp`). Assumes at most `band` differences between the two input sequences, which dramatically reduces the dynamic programming cost relative to full NW alignment. Inherits the complete interface of `CNWAligner`.
+
+```cpp
+#include <algo/align/nw/nw_band_aligner.hpp>
+USING_NCBI_SCOPE;
+
+// Construct with explicit sequences and band width
+string seq1 = "ACGTACGT";
+string seq2 = "ACGAACGT";
+
+CBandAligner aligner(seq1, seq2,
+                     /*scoremat=*/nullptr,  // IUPACna scoring
+                     /*band=*/4);
+
+CBandAligner::TScore score = aligner.Run();
+
+// Retrieve alignment transcript
+CNWAligner::TTranscript tr = aligner.GetTranscript();
+string tr_str = aligner.GetTranscriptString();  // e.g. "MMMRMMMM"
+
+cout << "Score: " << score << "\n";
+cout << "Transcript: " << tr_str << "\n";
+```
+
+**Constructors**
+
+<ParamField path="band" type="size_t">
+  Half-band width: the alignment is constrained so that no cell more than `band` positions off the main diagonal is computed. Larger values allow more divergence but use more memory and time.
+</ParamField>
+<ParamField path="seq1 / seq2" type="const string& or const char*+size_t">
+  The two sequences to align, in IUPAC-na (when `scoremat` is null) or amino-acid alphabet.
+</ParamField>
+<ParamField path="scoremat" type="const SNCBIPackedScoreMatrix*">
+  Optional scoring matrix. Pass `nullptr` to use default nucleotide match/mismatch scoring.
+</ParamField>
+
+**Key setters (inherited from `CNWAligner`)**
+
+| Method | Description |
+|--------|-------------|
+| `SetSequences(const char*, size_t, const char*, size_t)` | Update sequences after construction. |
+| `SetBand(size_t)` | Change the band width before calling `Run()`. |
+| `SetWm(TScore)` | Match reward (nucleotide mode). Default: `+1`. |
+| `SetWms(TScore)` | Mismatch penalty (nucleotide mode). Default: `−2`. |
+| `SetWg(TScore)` | Gap-open penalty. Default: `−5`. |
+| `SetWs(TScore)` | Gap-extension penalty. Default: `−2`. |
+| `SetEndSpaceFree(bool,bool,bool,bool)` | Control end-gap penalties for each end of both sequences. |
+
+**Key getters**
+
+<ResponseField name="Run()" type="TScore">
+  Computes the optimal banded alignment and returns its score. Must be called before `GetTranscript()` or `GetScore()`.
+</ResponseField>
+
+<ResponseField name="Run(CScope&, const CSeq_loc&, const CSeq_loc&)" type="CRef<CSeq_align>">
+  Overload that loads sequences from the Object Manager and returns a `CSeq_align` ASN.1 object.
+</ResponseField>
+
+<ResponseField name="GetScore()" type="TScore">
+  Returns the alignment score computed by `Run()`.
+</ResponseField>
+
+<ResponseField name="GetTranscript(bool reversed=true)" type="TTranscript">
+  Returns the backtrace as a vector of `ETranscriptSymbol` values (`eTS_Match`, `eTS_Replace`, `eTS_Delete`, `eTS_Insert`). Pass `false` to get it in forward (5'→3') order.
+</ResponseField>
+
+<ResponseField name="GetTranscriptString()" type="string">
+  Human-readable transcript: `M`=match, `R`=replace, `D`=delete, `I`=insert.
+</ResponseField>
+
+<ResponseField name="GetDense_seg(...)" type="CRef<CDense_seg>">
+  Convert the transcript to a `CDense_seg` ASN.1 alignment segment, suitable for embedding in a `CSeq_align`.
+</ResponseField>
+
+</Accordion>
+
+<Accordion title="CSplign">
+
+Computes spliced cDNA-to-genomic alignments (`include/algo/align/splign/splign.hpp`). Takes a set of pre-computed HSPs (`THitRefs`) as input, identifies compartments (putative gene loci), and produces per-compartment spliced alignments respecting canonical splice signals.
+
+```cpp
+#include <algo/align/splign/splign.hpp>
+USING_NCBI_SCOPE;
+
+CSplign splign;
+
+// Configure scope for sequence access
+CRef<objects::CScope>& sc = splign.SetScope();
+sc->AddDefaults();
+
+// Configure alignment parameters
+splign.SetEndGapDetection(true);
+splign.SetPolyaDetection(true);
+splign.SetMaxIntron(1500000);          // 1.5 Mb max intron
+splign.SetMinExonIdentity(0.75);       // 75% min exon identity
+splign.SetCompartmentPenalty(0.5);
+splign.SetScoringType(CSplign::eMrnaScoring);
+
+// Run: hitrefs is a vector<CRef<CBlastTabular>> from a BLAST search
+CSplign::THitRefs hitrefs = /* ... */;
+splign.Run(&hitrefs);
+
+// Retrieve results
+const CSplign::TResults& results = splign.GetResult();
+for (const CSplign::SAlignedCompartment& comp : results) {
+    if (comp.m_Status == CSplign::SAlignedCompartment::eStatus_Ok) {
+        cout << "Compartment " << comp.m_Id
+             << " score=" << comp.m_Score
+             << " segments=" << comp.m_Segments.size() << "\n";
+    }
+}
+```
+
+**Constructor**
+
+Default-constructed; all parameters set through accessors.
+
+**Configuration methods**
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `SetEndGapDetection` | `void SetEndGapDetection(bool)` | When `true`, detects and handles unaligned ends of the transcript. |
+| `SetPolyaDetection` | `void SetPolyaDetection(bool)` | Enable/disable poly-A tail detection and trimming. |
+| `SetStrand` | `void SetStrand(bool)` | `true` for sense, `false` for antisense. |
+| `SetMaxIntron` | `void SetMaxIntron(size_t)` | Maximum allowed intron length in bases. |
+| `SetMaxGenomicExtent` | `void SetMaxGenomicExtent(size_t)` | Space to search beyond the terminal HSPs on each side. |
+| `SetCompartmentPenalty` | `void SetCompartmentPenalty(double)` | Penalty for each compartment as a fraction of transcript length. |
+| `SetMinCompartmentIdentity` | `void SetMinCompartmentIdentity(double)` | Minimum overall identity required to report a compartment. |
+| `SetMinExonIdentity` | `void SetMinExonIdentity(double)` | Exons below this identity are treated as gaps. |
+| `SetScoringType` | `void SetScoringType(EScoringType)` | `eMrnaScoring` or `eEstScoring`; adjusts default match/mismatch/splice scores. |
+| `SetMatchScore` / `SetMismatchScore` | `void(int)` | Override individual alignment scores. |
+| `SetGtAgSpliceScore` | `void(int)` | Bonus for canonical GT-AG splice sites. |
+| `PreserveScope` | `void PreserveScope(bool)` | When `true`, previously loaded sequences remain in the scope between calls. |
+
+**Execution and results**
+
+<ResponseField name="Run(THitRefs* hitrefs)" type="void">
+  Identifies compartments from the input HSPs, then aligns each compartment against the genomic sequence. Results are stored internally.
+</ResponseField>
+
+<ResponseField name="GetResult()" type="const TResults&">
+  Returns all `SAlignedCompartment` objects computed by the most recent `Run()` call.
+</ResponseField>
+
+**`SAlignedCompartment` fields**
+
+<ResponseField name="m_Id" type="size_t">Compartment identifier (monotonically increasing).</ResponseField>
+<ResponseField name="m_Status" type="ECompartmentStatus">`eStatus_Ok`, `eStatus_Empty`, or `eStatus_Error`.</ResponseField>
+<ResponseField name="m_Score" type="float">Overall alignment score for the compartment.</ResponseField>
+<ResponseField name="m_Segments" type="TSegments">Vector of `CNWFormatter::SSegment` objects describing each exon and intron.</ResponseField>
+<ResponseField name="m_QueryStrand / m_SubjStrand" type="bool">`true` = plus strand.</ResponseField>
+<ResponseField name="m_PolyA" type="size_t">Length of the detected poly-A tail (0 if none).</ResponseField>
+
+</Accordion>
+
+<Accordion title="CAlignCleanup">
+
+Removes redundancies from an alignment set and produces a canonical, non-overlapping output (`include/algo/sequence/align_cleanup.hpp`). Uses either the `CAlnVec`-based or the newer `CAnchoredAln`-based backend.
+
+```cpp
+#include <algo/sequence/align_cleanup.hpp>
+USING_NCBI_SCOPE;
+USING_SCOPE(objects);
+
+CAlignCleanup cleanup(scope);
+
+// Control behaviour
+cleanup.SortInputsByScore(true);
+cleanup.FillUnaligned(false);
+
+// Input and output containers
+CAlignCleanup::TAligns input_aligns;
+// populate input_aligns with CRef<CSeq_align> objects ...
+
+CAlignCleanup::TAligns cleaned;
+cleanup.Cleanup(input_aligns, cleaned,
+                CAlignCleanup::eAnchoredAlign,
+                CSeq_align::TSegs::e_Denseg);
+```
+
+**Constructors**
+
+<ParamField path="scope" type="CScope&">
+  Scope providing sequence data needed for alignment management. A default-constructed `CAlignCleanup` has no scope and requires all sequences to be self-contained.
+</ParamField>
+
+**Configuration setters**
+
+| Method | Description |
+|--------|-------------|
+| `SortInputsByScore(bool)` | Sort input alignments by score before processing; ensures highest-scoring alignments take priority. |
+| `PreserveRows(bool)` | Treat the alignment as a self-comparison (query vs. itself). |
+| `FillUnaligned(bool)` | Insert explicit gap segments for unaligned regions between aligned blocks. |
+
+**`Cleanup` overloads**
+
+<ResponseField name="Cleanup(const TAligns&, TAligns&, EMode, E_Choice)" type="void">
+  Primary overload. `EMode` is `eAlignVec` or `eAnchoredAlign` (default). `E_Choice` specifies the output segment type (e.g., `e_Denseg`, `e_Spliced`).
+</ResponseField>
+
+<ResponseField name="Cleanup(const TConstAligns&, TAligns&, ...)" type="void">
+  Overload accepting const input alignments.
+</ResponseField>
+
+**Static utility**
+
+| Method | Description |
+|--------|-------------|
+| `CreatePairwiseFromMultiple(const CSeq_align&, TAligns&)` | Decompose a multiple-sequence alignment into pairwise alignments. |
+
+</Accordion>
+
+<Accordion title="CAlignCompare">
+
+Compares two sets of alignments at configurable resolution—interval, exon, span, or full alignment—and computes match statistics (`include/algo/align/util/align_compare.hpp`). Intended for benchmarking or QC workflows where an experimental alignment set is compared against a reference.
+
+```cpp
+#include <algo/align/util/align_compare.hpp>
+#include <algo/align/util/align_source.hpp>
+USING_NCBI_SCOPE;
+
+// IAlignSource adapters wrap the alignment sets
+IAlignSource& set1 = /* ... */;
+IAlignSource& set2 = /* ... */;
+
+CAlignCompare cmp(set1, set2,
+                  CAlignCompare::e_Interval,  // comparison mode
+                  /*strict=*/false,
+                  /*ignore_not_present=*/false,
+                  CAlignCompare::e_Both);     // compare both query & subject rows
+
+while (!cmp.EndOfData()) {
+    vector<const CAlignCompare::SAlignment*> group = cmp.NextGroup();
+    for (const auto* aln : group) {
+        cout << "Set " << aln->source_set
+             << " match=" << aln->match_level << "\n";
+    }
+}
+
+cout << "Equiv (set 1): " << cmp.CountEquivSet1() << "\n";
+cout << "Equiv (set 2): " << cmp.CountEquivSet2() << "\n";
+cout << "Only in set 1: " << cmp.CountOnlySet1() << "\n";
+cout << "Only in set 2: " << cmp.CountOnlySet2() << "\n";
+```
+
+**Constructor**
+
+<ParamField path="set1 / set2" type="IAlignSource&">
+  Input alignment sources. Any class implementing `IAlignSource` works; concrete implementations include file-backed and in-memory sources.
+</ParamField>
+<ParamField path="mode" type="EMode">
+  Comparison granularity: `e_Interval` (individual aligned intervals), `e_Exon`, `e_Span`, `e_Intron`, or `e_Full` (whole alignment).
+</ParamField>
+<ParamField path="strict" type="bool">
+  When `true`, only exact boundary matches count as equivalent.
+</ParamField>
+<ParamField path="row" type="ERowComparison">
+  `e_Query`, `e_Subject`, or `e_Both` — which sequence rows to use for grouping.
+</ParamField>
+
+**Comparison modes (`EMatchLevel`)**
+
+| Value | Meaning |
+|-------|---------|
+| `e_Equiv` | Boundaries match exactly. |
+| `e_Overlap` | Alignments overlap but boundaries differ. |
+| `e_OverlapBetter` / `e_OverlapWorse` | Overlapping alignment that is better or worse than its counterpart. |
+| `e_NoMatch` | No corresponding alignment in the other set. |
+
+**Statistics accessors**
+
+| Method | Returns |
+|--------|---------|
+| `CountEquivSet1()` / `CountEquivSet2()` | Alignments that matched exactly in each set. |
+| `CountOverlapSet1()` / `CountOverlapSet2()` | Alignments that had an overlapping (but non-exact) match. |
+| `CountOnlySet1()` / `CountOnlySet2()` | Alignments with no match in the opposite set. |
+| `CountBasesEquivSet1()` / `...Set2()` | Aligned bases in equivalent alignments. |
+
+</Accordion>
+
+</AccordionGroup>
+
+---
+
+<AccordionGroup>
+
+## Utilities
+
+<Accordion title="CScoreBuilder">
+
+Computes and optionally annotates BLAST and general alignment scores on `CSeq_align` objects (`include/algo/align/util/score_builder.hpp`). Can be initialized from a `CBlastOptionsHandle` to ensure consistent scoring parameters.
+
+```cpp
+#include <algo/align/util/score_builder.hpp>
+#include <algo/blast/api/blast_nucl_options.hpp>
+USING_NCBI_SCOPE;
+USING_SCOPE(objects);
+
+// Initialize from a BLAST options handle
+CBlastNucleotideOptionsHandle opts;
+CScoreBuilder builder(opts);
+builder.SetEffectiveSearchSpace(2000000000LL);
+
+CScope& scope = /* ... */;
+CSeq_align& align = /* ... */;
+
+// Compute scores without modifying the alignment
+int   raw_score = builder.GetBlastScore(scope, align);
+double bit_score = builder.GetBlastBitScore(scope, align);
+double evalue    = builder.GetBlastEValue(scope, align);
+
+// Add scores as annotation on the Seq-align object
+builder.AddScore(scope, align, CSeq_align::eScore_Score);
+builder.AddScore(scope, align, CSeq_align::eScore_BitScore);
+builder.AddScore(scope, align, CSeq_align::eScore_EValue);
+
+// Add full traceback strings
+builder.AddTracebacks(scope, align);
+```
+
+**Constructors**
+
+<ParamField path="(default)" type="">
+  Default-constructed; uses nucleotide match/mismatch defaults.
+</ParamField>
+<ParamField path="program_type" type="blast::EProgram">
+  Initialize scoring parameters for a specific BLAST program (e.g., `eBlastn`, `eBlastp`).
+</ParamField>
+<ParamField path="options" type="blast::CBlastOptionsHandle&">
+  Initialize from an existing options handle; copies gap costs, matrix, and program type.
+</ParamField>
+
+**Score computation**
+
+<ResponseField name="GetBlastScore(CScope&, const CSeq_align&)" type="int">
+  Computes the raw BLAST alignment score using the configured scoring matrix and gap parameters.
+</ResponseField>
+
+<ResponseField name="GetBlastBitScore(CScope&, const CSeq_align&)" type="double">
+  Converts the raw score to a bit score using Karlin-Altschul parameters.
+</ResponseField>
+
+<ResponseField name="GetBlastEValue(CScope&, const CSeq_align&)" type="double">
+  Computes the statistical expectation value. Requires `SetEffectiveSearchSpace` to have been called.
+</ResponseField>
+
+<ResponseField name="ComputeScore(CScope&, const CSeq_align&, CSeq_align::EScoreType)" type="double">
+  General-purpose score computation for any `EScoreType` (identity, coverage, etc.).
+</ResponseField>
+
+**Score annotation**
+
+| Method | Description |
+|--------|-------------|
+| `AddScore(CScope&, CSeq_align&, CSeq_align::EScoreType)` | Compute and embed a score into the alignment's score list. |
+| `AddScore(CScope&, list<CRef<CSeq_align>>&, CSeq_align::EScoreType)` | Batch version operating on a list of alignments. |
+| `AddTracebacks(CScope&, CSeq_align&)` | Compute and embed traceback strings for each row. |
+| `GetTraceback(const CSeq_align&, CSeq_align::TDim row)` | Retrieve a traceback string for the given row without modifying the alignment. |
+
+**Configuration**
+
+| Method | Description |
+|--------|-------------|
+| `SetGapOpen(int)` | Override the gap-open penalty. |
+| `SetGapExtend(int)` | Override the gap-extension penalty. |
+| `SetEffectiveSearchSpace(Int8)` | Required for correct e-value calculation; set to the effective search space of the original BLAST run. |
+
+</Accordion>
+
+<Accordion title="NMismatch and NSeq_align (Utility Namespaces)">
+
+These are namespace-level utility functions documented and used within the toolkit's source but not exposed through a dedicated header of their own. The relevant functionality is provided through `CScoreBuilderBase` (`include/objtools/alnmgr/score_builder_base.hpp`) and the score annotation methods of `CScoreBuilder` described above.
+
+For direct mismatch counting on a `CSeq_align`, use `CScoreBuilder::ComputeScore` with `CSeq_align::eScore_PercentIdentity` or derive counts from the raw score and alignment length:
+
+```cpp
+#include <algo/align/util/score_builder.hpp>
+USING_NCBI_SCOPE;
+USING_SCOPE(objects);
+
+CScoreBuilder builder(eBlastn);
+
+double pct_id = builder.ComputeScore(
+    scope, align, CSeq_align::eScore_PercentIdentity);
+
+double coverage = builder.ComputeScore(
+    scope, align, CSeq_align::eScore_PercentCoverage);
+```
+
+For utilities that work with collections of `CSeq_align` objects (sorting, filtering, selecting best placements), see `include/algo/align/util/`:
+
+| Header | Key class/function |
+|--------|-------------------|
+| `align_filter.hpp` | `CAlignFilter` — expression-based filter |
+| `align_sort.hpp` | Comparison functors for sorting alignment lists |
+| `best_placement.hpp` | Select best-scoring placements per query |
+| `hit_filter.hpp` | `CHitFilter` — coverage-driven hit filtering |
+| `collection_score.hpp` | Aggregate scores over alignment collections |
+
+</Accordion>
+
+</AccordionGroup>
+
+---
+
+## Code Examples
+
+### CDustMasker: Masking low-complexity regions
+
+```cpp
+#include <algo/dustmask/symdust.hpp>
+#include <objmgr/object_manager.hpp>
+#include <objmgr/scope.hpp>
+#include <objmgr/seq_vector.hpp>
+#include <objects/seqloc/Seq_loc.hpp>
+
+USING_NCBI_SCOPE;
+USING_SCOPE(objects);
+
+int main()
+{
+    // Build scope and load sequence
+    CRef<CObjectManager> objmgr = CObjectManager::GetInstance();
+    CGBDataLoader::RegisterInObjectManager(*objmgr);
+    CRef<CScope> scope(new CScope(*objmgr));
+    scope->AddDefaults();
+
+    CBioseq_Handle bsh = scope->GetBioseqHandle(
+        *CSeq_id::CreateIdFrom("NC_000001.11"));
+
+    CSeqVector sv = bsh.GetSeqVector(CBioseq_Handle::eCoding_Iupac);
+
+    // Create masker with default parameters
+    CSymDustMasker masker(
+        CSymDustMasker::DEFAULT_LEVEL,
+        CSymDustMasker::DEFAULT_WINDOW,
+        CSymDustMasker::DEFAULT_LINKER);
+
+    // Apply masking
+    auto masks = masker(sv);
+
+    cout << "Low-complexity intervals on NC_000001.11:\n";
+    for (const auto& interval : *masks) {
+        cout << "  [" << interval.first << ", "
+             << interval.second << "]\n";
+    }
+    return 0;
+}
+```
+
+### CBandAligner: Pairwise global alignment
+
+```cpp
+#include <algo/align/nw/nw_band_aligner.hpp>
+#include <objmgr/object_manager.hpp>
+#include <objmgr/scope.hpp>
+
+USING_NCBI_SCOPE;
+USING_SCOPE(objects);
+
+int main()
+{
+    // Short demonstration sequences (IUPACna)
+    const string seq1 = "ACGTACGTACGT";
+    const string seq2 = "ACGAACGAACGT";
+
+    // Band of 4 allows at most 2 insertions/deletions
+    CBandAligner aligner(seq1, seq2,
+                         /*scoremat=*/nullptr,
+                         /*band=*/4);
+
+    // Default nucleotide scores: match=+1, mismatch=-2, gapopen=-5, gapext=-2
+    CNWAligner::TScore score = aligner.Run();
+
+    cout << "Alignment score : " << score << "\n";
+    cout << "Transcript      : " << aligner.GetTranscriptString() << "\n";
+
+    // Build a Dense-seg for use in ASN.1 output
+    CRef<CDense_seg> ds = aligner.GetDense_seg(
+        0, eNa_strand_plus,   // seq1 start and strand
+        0, eNa_strand_plus,   // seq2 start and strand
+        /*trim_end_gaps=*/false);
+
+    // Or, align directly from sequence identifiers via Object Manager
+    CRef<CObjectManager> objmgr = CObjectManager::GetInstance();
+    CGBDataLoader::RegisterInObjectManager(*objmgr);
+    CRef<CScope> scope(new CScope(*objmgr));
+    scope->AddDefaults();
+
+    CSeq_id id1("NM_001301717.2");
+    CSeq_id id2("NM_001301718.1");
+
+    CBandAligner aln2;
+    aln2.SetBand(50);
+    CRef<CSeq_align> align = aln2.Run(*scope, id1, id2,
+                                       /*trim_end_gaps=*/true);
+    return 0;
+}
+```

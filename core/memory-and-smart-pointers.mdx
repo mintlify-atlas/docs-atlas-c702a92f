@@ -1,0 +1,333 @@
+---
+title: "CObject, CRef, and Smart Pointer Patterns in NCBI"
+description: "Manage object lifetimes safely with CObject reference counting, CRef and CConstRef smart pointers, CWeakRef non-owning references, and AutoPtr RAII wrappers."
+---
+
+The NCBI C++ Toolkit uses its own reference-counting system instead of `std::shared_ptr` for the majority of toolkit objects. At the center is `CObject`, a base class that provides an atomic reference counter and heap-state tracking. The smart pointer templates `CRef<T>` and `CConstRef<T>` work with any class derived from `CObject` and form the backbone of safe memory management throughout the toolkit.
+
+## CObject: The Reference-Counted Base Class
+
+`CObject` (declared in `<corelib/ncbiobj.hpp>`) provides intrusive reference counting — the counter lives inside the object itself rather than in a separate control block:
+
+```cpp
+class CObject : public CDebugDumpable
+{
+public:
+    // Query reference state
+    bool CanBeDeleted(void)       const noexcept; // allocated on heap
+    bool Referenced(void)         const noexcept; // ref count > 0
+    bool ReferencedOnlyOnce(void) const noexcept; // ref count == 1
+
+    // Manual reference management (prefer CRef instead)
+    void AddReference(void)    const;
+    void RemoveReference(void) const noexcept;
+    void ReleaseReference(void) const; // decrement without delete
+
+    // Heap management
+    virtual void DoNotDeleteThisObject(void);
+    virtual void DoDeleteThisObject(void);
+
+    // Throw a typed null pointer exception
+    static void ThrowNullPointerException(void);
+};
+```
+
+The counter is stored as `atomic<Uint8>`, making reference count increments and decrements thread-safe on all platforms without external locking.
+
+<Warning>
+Do not call `AddReference()` and `RemoveReference()` directly unless you are writing a custom smart pointer or locker. Use `CRef<T>` instead — it guarantees balanced lock/unlock even in the presence of exceptions.
+</Warning>
+
+## CRef\<T\>: The Primary Smart Pointer
+
+`CRef<T>` is a reference-owning smart pointer for any type `T` that derives from `CObject`. It increments the reference count on construction, decrements on destruction or `Reset()`, and deletes the object when the count reaches zero.
+
+### Construction and assignment
+
+```cpp
+#include <corelib/ncbiobj.hpp>
+USING_NCBI_SCOPE;
+
+// Assume: class CSeqRecord : public CObject { ... };
+
+// null CRef (default constructor)
+CRef<CSeqRecord> rec;   // IsNull() == true
+
+// From a raw pointer (takes ownership of existing ref count)
+CRef<CSeqRecord> rec2(new CSeqRecord("NM_001234"));
+
+// Copy: both refs now point to the same object
+CRef<CSeqRecord> rec3 = rec2; // ref count becomes 2
+
+// Move: rec2 becomes null, ref count stays at 2
+CRef<CSeqRecord> rec4 = std::move(rec2); // rec2 is now null
+
+// Assign from pointer
+CRef<CSeqRecord> rec5;
+rec5.Reset(new CSeqRecord("NM_005678"));
+```
+
+### Null checking
+
+```cpp
+CRef<CSeqRecord> ref;
+
+// Three equivalent null-check idioms
+if (ref.IsNull())  { /* ... */ }
+if (ref.Empty())   { /* ... */ }
+if (!ref)          { /* ... */ }
+
+// Three equivalent non-null checks
+if (ref.NotNull())  { /* ... */ }
+if (ref.NotEmpty()) { /* ... */ }
+if (ref)            { /* ... */ }
+```
+
+### Dereferencing
+
+```cpp
+CRef<CSeqRecord> ref(new CSeqRecord("NM_001234"));
+
+// Dereference with operator*
+CSeqRecord& obj = *ref;
+
+// Member access with operator->
+string accession = ref->GetAccession();
+
+// GetObject() — same as *ref but more explicit
+CSeqRecord& obj2 = ref.GetObject();
+
+// GetPointer() — returns raw pointer (may be null)
+CSeqRecord* ptr = ref.GetPointer();
+```
+
+Dereferencing a null `CRef` via `operator*`, `operator->`, or `GetObject()` throws `CObjectException::eNoRef`.
+
+### Reset
+
+```cpp
+CRef<CSeqRecord> ref(new CSeqRecord("NM_001234"));
+
+// Reset to null — decrements ref count, may delete object
+ref.Reset();
+// ref.IsNull() == true
+
+// Reset to a new object
+ref.Reset(new CSeqRecord("NM_005678"));
+
+// Release the pointer without decrementing ref count
+// (caller takes ownership of the reference)
+CSeqRecord* raw = ref.Release();
+// ref is now null; caller must eventually call raw->RemoveReference()
+```
+
+## CConstRef\<T\>: The Read-Only Variant
+
+`CConstRef<T>` is identical to `CRef<T>` but provides only `const` access to the managed object. It uses the same reference counter as `CRef<T>` and can be constructed from a `CRef<T>`:
+
+```cpp
+CRef<CSeqRecord>      mutable_ref(new CSeqRecord("NM_001234"));
+CConstRef<CSeqRecord> const_ref(mutable_ref);
+
+// const access only
+const string& acc = const_ref->GetAccession();
+
+// IsNull / NotNull / Reset work identically
+if (const_ref.NotNull()) {
+    const CSeqRecord& obj = *const_ref;
+}
+```
+
+Use `CConstRef` in function parameters when the function does not need to modify the object:
+
+```cpp
+void PrintRecord(CConstRef<CSeqRecord> rec)
+{
+    if (rec) {
+        NcbiCout << rec->GetAccession() << NcbiEndl;
+    }
+}
+```
+
+## CWeakRef\<T\>: Non-Owning Weak References
+
+`CWeakRef<T>` stores a non-owning reference that does not affect the reference count. It can detect when the object has been destroyed. To use `CWeakRef`, the class must derive from `CWeakObject` (which in turn derives from `CObject`):
+
+```cpp
+#include <corelib/ncbiobj.hpp>
+USING_NCBI_SCOPE;
+
+class CCache : public CWeakObject { ... };
+
+CRef<CCache>  strong(new CCache());
+CWeakRef<CCache> weak(strong.GetPointer());
+
+// Lock to get a temporary owning reference
+CRef<CCache> locked = weak.Lock();
+if (locked) {
+    locked->LookupEntry("key");
+}
+// When strong goes out of scope, locked.IsNull() will be true
+// on the next call to weak.Lock()
+```
+
+<Note>
+`CWeakRef` is analogous to `std::weak_ptr` but works with the NCBI reference-counting system. Use it to break ownership cycles or to hold a cache reference that should not prevent object destruction.
+</Note>
+
+## AutoPtr\<T\>: RAII for Non-CObject Types
+
+`AutoPtr<T>` (available via `<corelib/ncbimisc.hpp>`, included transitively) provides RAII ownership for types that do **not** derive from `CObject` — i.e., it acts like `std::unique_ptr` but was present in the toolkit before C++11:
+
+```cpp
+#include <corelib/ncbimisc.hpp>
+USING_NCBI_SCOPE;
+
+// Takes ownership of a heap-allocated object
+AutoPtr<FILE> fp(fopen("data.txt", "r"), fclose);
+
+// AutoPtr with default delete (operator delete)
+AutoPtr<int[]> arr(new int[100]);
+
+// Move-like transfer
+AutoPtr<int> p1(new int(42));
+AutoPtr<int> p2 = p1; // p1 becomes null (unique ownership)
+```
+
+<Tip>
+In new code, prefer `std::unique_ptr` for non-CObject types and `CRef<T>` for `CObject`-derived types. `AutoPtr` remains available for compatibility with older toolkit code.
+</Tip>
+
+## CRef vs std::shared_ptr
+
+<Tabs>
+
+<Tab title="When to use CRef">
+
+Use `CRef<T>` for any class that:
+- Is part of the NCBI data model (ASN.1-generated classes all derive from `CObject`)
+- Participates in the NCBI object manager or other toolkit subsystems
+- Must interoperate with `CConstRef<T>`, `CWeakRef<T>`, or `CObjectMemoryPool`
+
+```cpp
+// Correct: CSeq_entry derives from CObject
+CRef<CSeq_entry> entry(new CSeq_entry());
+```
+
+</Tab>
+
+<Tab title="When to use std::shared_ptr">
+
+Use `std::shared_ptr` for:
+- Third-party types that do not inherit `CObject`
+- Types where you need `std::enable_shared_from_this`
+- Interoperability with code that does not use the NCBI toolkit
+
+```cpp
+// Non-CObject type — use shared_ptr
+auto conn = std::make_shared<DatabaseConnection>(host, port);
+```
+
+</Tab>
+
+</Tabs>
+
+## Thread Safety of Reference Counting
+
+The reference counter in `CObject` is `atomic<Uint8>`, which guarantees that `AddReference()` and `RemoveReference()` are safe to call from multiple threads simultaneously without additional locking. You can freely share a `CRef<T>` by copying it from multiple threads.
+
+However, thread safety of the counter does **not** imply thread safety of the pointed-to object's data:
+
+```cpp
+CRef<CSeqRecord> shared_ref(new CSeqRecord());
+
+// Safe: concurrent reference count operations are atomic
+auto thread_fn = [&]() {
+    CRef<CSeqRecord> local_copy = shared_ref; // safe
+    local_copy->ReadAccession();              // safe if read-only
+    // local_copy->SetAccession("NM_999");   // NOT safe without a mutex
+};
+```
+
+Use `CRWLock` or `CMutex` (from `<corelib/ncbimtx.hpp>`) to protect object data accessed from multiple threads.
+
+## Complete Example
+
+```cpp
+#include <corelib/ncbiobj.hpp>
+#include <corelib/ncbidiag.hpp>
+USING_NCBI_SCOPE;
+
+// A simple reference-counted sequence record
+class CSeqRecord : public CObject
+{
+public:
+    CSeqRecord(const string& acc, size_t len)
+        : m_Accession(acc), m_Length(len) {}
+
+    const string& GetAccession(void) const { return m_Accession; }
+    size_t        GetLength(void)    const { return m_Length; }
+
+private:
+    string m_Accession;
+    size_t m_Length;
+};
+
+// A cache that holds a weak reference to avoid cycles
+class CRecordCache : public CWeakObject
+{
+public:
+    void Store(CRef<CSeqRecord> rec)
+    {
+        m_Weak = rec.GetPointer();
+        m_Strong = std::move(rec); // take ownership
+    }
+
+    CRef<CSeqRecord> Fetch(void) const
+    {
+        return m_Weak.Lock();
+    }
+
+private:
+    CRef<CSeqRecord>      m_Strong;
+    CWeakRef<CSeqRecord>  m_Weak;
+};
+
+int main()
+{
+    // Create record
+    CRef<CSeqRecord> rec(new CSeqRecord("NM_001234", 1500));
+    ERR_POST(Info << "Created: " << rec->GetAccession()
+                  << " (refs=" << rec->Referenced() << ")");
+
+    {
+        // Second reference
+        CRef<CSeqRecord> copy = rec;
+        ERR_POST(Info << "After copy, ReferencedOnlyOnce="
+                      << rec->ReferencedOnlyOnce()); // false
+
+        // Const access
+        CConstRef<CSeqRecord> cref(rec);
+        ERR_POST(Info << "Length: " << cref->GetLength());
+    }
+    // copy and cref go out of scope here
+
+    ERR_POST(Info << "After scope: ReferencedOnlyOnce="
+                  << rec->ReferencedOnlyOnce()); // true
+
+    // Reset releases our ownership
+    rec.Reset();
+    // Object is now deleted; rec.IsNull() == true
+
+    return 0;
+}
+```
+
+<CardGroup cols={2}>
+  <Card title="Exceptions" icon="triangle-exclamation" href="/core/exceptions">
+    CObject-related exceptions like eNoRef and eRefDelete are defined in CObjectException.
+  </Card>
+  <Card title="Application Framework" icon="rocket" href="/core/application-framework">
+    The application registry and argument descriptors are managed internally via CRef.
+  </Card>
+</CardGroup>

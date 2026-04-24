@@ -1,80 +1,190 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: "Get Started with the NCBI C++ Toolkit"
+description: "Learn how to write, build, and run your first NCBI C++ application using CNcbiApplication and CArgDescriptions in under 15 minutes."
 ---
 
-## Get started in three steps
+The NCBI C++ Toolkit provides a structured application framework built around `CNcbiApplication`. Every toolkit application subclasses this class, overrides `Init()` to declare its arguments and configuration, and implements `Run()` to perform work. This guide walks you through building a complete working application based on the real `basic_sample` application in the toolkit source.
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+- A C++ compiler with C++17 support (GCC 7+, Clang 5+, or MSVC 2017+)
+- CMake 3.14 or later
+- A clone of the repository
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+## Steps
 
-### Step 2: Deploy your changes
+<Steps>
+  <Step title="Get the source code">
+    Clone the public repository from GitHub:
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    ```bash
+    git clone https://github.com/ncbi/ncbi-cxx-toolkit-public.git
+    cd ncbi-cxx-toolkit-public
+    ```
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    The repository contains both the library source in `src/` and public headers in `include/`. Sample applications live in `src/sample/app/`.
+  </Step>
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+  <Step title="Write your application">
+    Create a file `my_app.cpp`. The minimal application subclasses `CNcbiApplication` and overrides `Init()` and `Run()`. The pattern below is drawn directly from `src/sample/app/basic/basic_sample.cpp`:
 
-### Step 3: Go live
+    ```cpp my_app.cpp
+    #include <ncbi_pch.hpp>
+    #include <corelib/ncbiapp.hpp>
+    #include <corelib/ncbienv.hpp>
+    #include <corelib/ncbiargs.hpp>
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    USING_NCBI_SCOPE;
+
+    class CMyApplication : public CNcbiApplication
+    {
+    private:
+        virtual void Init(void);
+        virtual int  Run(void);
+    };
+
+    void CMyApplication::Init(void)
+    {
+        // Declare command-line arguments
+        unique_ptr<CArgDescriptions> arg_desc(new CArgDescriptions);
+        arg_desc->SetUsageContext(
+            GetArguments().GetProgramBasename(),
+            "My first NCBI C++ Toolkit application");
+
+        // Mandatory key argument:  -name <string>
+        arg_desc->AddKey(
+            "name", "PersonName",
+            "Name to greet",
+            CArgDescriptions::eString);
+
+        // Optional key argument with default:  -count <integer>  (default: 1)
+        arg_desc->AddDefaultKey(
+            "count", "RepeatCount",
+            "Number of times to print the greeting",
+            CArgDescriptions::eInteger, "1");
+        arg_desc->SetConstraint("count", new CArgAllow_Integers(1, 100));
+
+        // Boolean flag:  -loud
+        arg_desc->AddFlag("loud", "Print greeting in uppercase");
+
+        SetupArgDescriptions(arg_desc.release());
+    }
+
+    int CMyApplication::Run(void)
+    {
+        const CArgs& args = GetArgs();
+
+        string name  = args["name"].AsString();
+        int    count = args["count"].AsInteger();
+        bool   loud  = args["loud"].AsBoolean();
+
+        for (int i = 0; i < count; ++i) {
+            string greeting = "Hello, " + name + "!";
+            if (loud) {
+                NStr::ToUpper(greeting);
+            }
+            cout << greeting << "\n";
+        }
+        return 0;
+    }
+
+    int NcbiSys_main(int argc, ncbi::TXChar* argv[])
+    {
+        return CMyApplication().AppMain(argc, argv);
+    }
+    ```
+
+    Key points:
+    - `Init()` builds a `CArgDescriptions` object and calls `SetupArgDescriptions()` at the end
+    - `Run()` retrieves parsed values via `GetArgs()` and returns an exit code
+    - `NcbiSys_main` is the cross-platform entry point (handles `wchar_t` on Windows)
+  </Step>
+
+  <Step title="Create a CMakeLists.txt">
+    Place this `CMakeLists.txt` next to `my_app.cpp`. It uses the NCBI build system helpers:
+
+    ```cmake CMakeLists.txt
+    cmake_minimum_required(VERSION 3.14)
+
+    NCBI_begin_app(my_app)
+      NCBI_sources(my_app)
+      NCBI_uses_toolkit_libraries(xncbi)
+    NCBI_end_app()
+    ```
+
+    If you are building outside the toolkit source tree, link against the installed `ncbi-cxx-toolkit-core::core` CMake target instead of `xncbi`.
+  </Step>
+
+  <Step title="Configure and build">
+    From the root of the repository, configure with CMake then build:
+
+    <CodeGroup>
+    ```bash Linux / macOS
+    # Configure (creates build directory)
+    ./cmake-configure --with-build-root=build
+
+    # Build the toolkit and your application
+    cd build/build
+    make -j$(nproc) my_app
+    ```
+
+    ```bash Windows (PowerShell)
+    .\cmake-configure.bat --with-build-root=build
+    cd build\build
+    cmake --build . --config Release --target my_app
+    ```
+    </CodeGroup>
+
+    <Tip>
+    To build only a specific subtree rather than the entire toolkit, pass `--with-projects=path/to/your/project` to `cmake-configure`. This dramatically reduces build time for single applications.
+    </Tip>
+  </Step>
+
+  <Step title="Run your application">
+    ```bash
+    ./my_app -name World -count 3
+    # Hello, World!
+    # Hello, World!
+    # Hello, World!
+
+    ./my_app -name World -loud
+    # HELLO, WORLD!
+
+    # Built-in help is generated automatically
+    ./my_app -help
+    ```
+
+    The toolkit automatically generates `--help` output from your `CArgDescriptions` declarations. No extra code is needed.
+  </Step>
+</Steps>
+
+## Argument types
+
+`CArgDescriptions` supports six argument types via the `EType` enum:
+
+| Type | Enum value | Accessor |
+|------|-----------|----------|
+| String | `CArgDescriptions::eString` | `AsString()` |
+| Integer | `CArgDescriptions::eInteger` | `AsInteger()` |
+| 64-bit integer | `CArgDescriptions::eInt8` | `AsInt8()` |
+| Floating point | `CArgDescriptions::eDouble` | `AsDouble()` |
+| Boolean | `CArgDescriptions::eBoolean` | `AsBoolean()` |
+| Input file | `CArgDescriptions::eInputFile` | `AsInputFile()` |
+| Output file | `CArgDescriptions::eOutputFile` | `AsOutputFile()` |
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Application Framework" icon="terminal" href="/core/application-framework">
+    Learn all argument types, configuration files, and the full Init/Run/Exit lifecycle.
+  </Card>
+  <Card title="Diagnostics & Logging" icon="bug" href="/core/diagnostics-and-logging">
+    Use ERR_POST and severity levels to add structured logging to your application.
+  </Card>
+  <Card title="Object Manager" icon="database" href="/data/object-manager">
+    Load biological sequences and iterate features with CScope and CFeat_CI.
+  </Card>
+  <Card title="Building in Depth" icon="hammer" href="/building">
+    Advanced build system configuration, optional dependencies, and platform notes.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

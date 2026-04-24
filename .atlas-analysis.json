@@ -1,23 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "NCBI C++ Toolkit",
+  "projectType": "sdk-library",
+  "projectName": "NCBI C++ Toolkit",
+  "projectDescription": "A comprehensive C++ library and application framework developed by NCBI for building bioinformatics tools, handling biological sequence data, and accessing NCBI databases.",
   "theme": "maple",
-  "colors": {
-    "primary": "#1565C0",
-    "light": "#42A5F5",
-    "dark": "#0D47A1"
-  },
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/ncbi/ncbi-cxx-toolkit-public"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/ncbi/ncbi-cxx-toolkit-public"
-    }
-  },
+  "primaryColor": "#1565C0",
+  "lightColor": "#42A5F5",
+  "darkColor": "#0D47A1",
   "navigation": {
     "tabs": [
       {
@@ -99,5 +87,33 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "Application framework (CNcbiApplication) for building command-line and CGI applications",
+    "Object Manager for handling biological sequence data with lazy loading",
+    "ASN.1/XML/JSON serialization framework for NCBI data types",
+    "BLAST sequence alignment algorithm library",
+    "Database API abstraction layer supporting multiple DBMS backends",
+    "Portable networking library with HTTP, socket, and service connector support",
+    "Comprehensive diagnostics and logging infrastructure",
+    "Thread-safe reference-counted smart pointers (CRef/CObject)",
+    "CGI/FastCGI framework for web application development",
+    "Sequence masking and filtering algorithms (DUST, WindowMasker, SEG)"
+  ],
+  "publicApiSurface": [
+    "CNcbiApplication — base class for all NCBI applications",
+    "CArgDescriptions / CArgs — command-line argument parsing",
+    "CNcbiDiag / ERR_POST — diagnostic and logging macros",
+    "CObject / CRef<T> / CConstRef<T> — reference-counted objects",
+    "NStr — string utility functions",
+    "CObjectManager — biological sequence object manager",
+    "CScope — data scope for sequence object retrieval",
+    "CBioseq_Handle / CFeat_CI / CSeq_align — sequence data iterators",
+    "CObjectOStream / CObjectIStream — ASN.1/XML/JSON serialization",
+    "CHttpSession / CHttpRequest — HTTP client",
+    "CSocket / CConn_IOStream — network connections",
+    "IDatabase / IConnection / IStatement — database access interfaces",
+    "CBLAST / CBlastOptionsHandle — BLAST search interface",
+    "CCgiApplication / CCgiRequest / CCgiResponse — CGI framework"
+  ]
 }

@@ -1,0 +1,302 @@
+---
+title: "NCBI Serial Library: ASN.1, XML, and JSON Streaming I/O"
+description: "Reference for CObjectOStream, CObjectIStream, ESerialDataFormat, hook classes, and formatting flags for reading and writing NCBI ASN.1, XML, and JSON data."
+---
+
+The NCBI serial library (`serial`) provides format-agnostic encoding and decoding of ASN.1 data objects. The same toolkit data types — `CBioseq`, `CSeq_entry`, `CSeq_annot`, and thousands of others — can be written and read in ASN.1 text, ASN.1 binary, XML, or JSON by selecting a different `ESerialDataFormat` value. Hook classes allow code to intercept the serialization process for filtering, transformation, or lazy loading.
+
+---
+
+## ESerialDataFormat
+
+```cpp
+#include <serial/serialdef.hpp>
+
+enum ESerialDataFormat {
+    eSerial_None       = 0,
+    eSerial_AsnText    = 1,   ///< ASN.1 text format
+    eSerial_AsnBinary  = 2,   ///< ASN.1 binary format
+    eSerial_Xml        = 3,   ///< XML format
+    eSerial_Json       = 4    ///< JSON format
+};
+```
+
+Pass one of these values to `CObjectOStream::Open()` or `CObjectIStream::Open()` to select the encoding.
+
+---
+
+## CObjectOStream
+
+`CObjectOStream` is the abstract base class for serial object encoders. Instances are always heap-allocated and managed by the caller (typically via `unique_ptr`).
+
+```cpp
+#include <serial/objostr.hpp>
+#include <objects/seq/Bioseq.hpp>
+
+unique_ptr<CObjectOStream> os(
+    CObjectOStream::Open(eSerial_AsnText, cout));
+*os << *my_bioseq;
+```
+
+### Open() — stream overload
+
+```cpp
+static CObjectOStream* Open(
+    ESerialDataFormat    format,
+    CNcbiOstream&        outStream,
+    EOwnership           deleteOutStream = eNoOwnership,
+    TSerial_Format_Flags formatFlags     = 0
+);
+```
+
+Creates a writer attached to an existing output stream.
+
+<ParamField path="format" type="ESerialDataFormat" required>
+One of `eSerial_AsnText`, `eSerial_AsnBinary`, `eSerial_Xml`, `eSerial_Json`.
+</ParamField>
+<ParamField path="outStream" type="CNcbiOstream&" required>
+Destination output stream.
+</ParamField>
+<ParamField path="deleteOutStream" type="EOwnership">
+Pass `eTakeOwnership` to have the writer delete the stream when it is destroyed.
+</ParamField>
+<ParamField path="formatFlags" type="TSerial_Format_Flags">
+Format-specific flags (see `ESerial_AsnText_Flags`, `ESerial_Xml_Flags`, `ESerial_Json_Flags`).
+</ParamField>
+
+<ResponseField name="return" type="CObjectOStream*">
+Heap-allocated writer; the caller is responsible for deletion.
+</ResponseField>
+
+### Open() — file overload
+
+```cpp
+static CObjectOStream* Open(
+    ESerialDataFormat    format,
+    const string&        fileName,
+    TSerialOpenFlags     openFlags   = 0,
+    TSerial_Format_Flags formatFlags = 0
+);
+```
+
+Creates a writer that opens and owns a file stream.
+
+<ParamField path="fileName" type="const string&" required>
+Path to the output file.
+</ParamField>
+<ParamField path="openFlags" type="TSerialOpenFlags">
+Bitwise OR of `ESerialOpenFlags` values, e.g. `eSerial_StdWhenEmpty`.
+</ParamField>
+
+### Write operator
+
+```cpp
+// Write an object (non-member function template)
+template<class TObject>
+CObjectOStream& operator<<(CObjectOStream& os, const TObject& obj);
+```
+
+Serializes any ASN.1-typed object. The type must be registered with the NCBI serial type infrastructure (all classes generated from ASN.1 definitions are).
+
+```cpp
+unique_ptr<CObjectOStream> os(
+    CObjectOStream::Open(eSerial_Xml, "output.xml"));
+*os << *seq_entry;
+```
+
+### Formatting flags
+
+```cpp
+// For eSerial_AsnText:
+enum ESerial_AsnText_Flags {
+    fSerial_AsnText_NoIndentation = 1 << 0,  ///< Compact output
+    fSerial_AsnText_RealFull      = 1 << 1   ///< Full floating-point precision
+};
+
+// For eSerial_Xml:
+enum ESerial_Xml_Flags {
+    fSerial_Xml_NoIndentation  = 1 << 0,
+    fSerial_Xml_NoAttrib       = 1 << 1,
+    fSerial_Xml_NoEol          = 1 << 2,
+    fSerial_Xml_NoXmlDecl      = 1 << 3,
+    fSerial_Xml_RefDTD         = 1 << 4,
+    fSerial_Xml_Namespace      = 1 << 5
+};
+
+// For eSerial_Json:
+enum ESerial_Json_Flags {
+    fSerial_Json_NoIndentation = 1 << 0
+};
+```
+
+---
+
+## CObjectIStream
+
+`CObjectIStream` is the abstract base class for serial object decoders. Symmetrical with `CObjectOStream`.
+
+```cpp
+#include <serial/objistr.hpp>
+
+unique_ptr<CObjectIStream> is(
+    CObjectIStream::Open(eSerial_AsnText, cin));
+CRef<CBioseq> bseq(new CBioseq());
+*is >> *bseq;
+```
+
+### Open() — stream overload
+
+```cpp
+static CObjectIStream* Open(
+    ESerialDataFormat format,
+    CNcbiIstream&     inStream,
+    EOwnership        deleteInStream = eNoOwnership
+);
+```
+
+<ParamField path="format" type="ESerialDataFormat" required>
+Encoding format of the input data.
+</ParamField>
+<ParamField path="inStream" type="CNcbiIstream&" required>
+Source input stream.
+</ParamField>
+<ParamField path="deleteInStream" type="EOwnership">
+Pass `eTakeOwnership` to take ownership of the stream.
+</ParamField>
+
+### Open() — file overload
+
+```cpp
+static CObjectIStream* Open(
+    ESerialDataFormat format,
+    const string&     fileName,
+    TSerialOpenFlags  openFlags = 0
+);
+```
+
+### Read operator
+
+```cpp
+template<class TObject>
+CObjectIStream& operator>>(CObjectIStream& is, TObject& obj);
+```
+
+Deserializes the next object from the stream into `obj`.
+
+```cpp
+unique_ptr<CObjectIStream> is(
+    CObjectIStream::Open(eSerial_AsnBinary, "data.asn"));
+
+CRef<CSeq_entry> entry(new CSeq_entry());
+*is >> *entry;
+```
+
+### Reading multiple objects
+
+```cpp
+CObjectIStream& is = ...;
+while (!is.EndOfData()) {
+    CRef<CBioseq> bseq(new CBioseq());
+    *is >> *bseq;
+    // process bseq
+}
+```
+
+---
+
+## Hook Classes
+
+Hooks intercept serialization at read or write time. They allow selective processing, filtering, or modification of ASN.1 data without reading the entire object tree into memory.
+
+### CReadObjectHook
+
+```cpp
+#include <serial/objhook.hpp>
+
+class CReadObjectHook : public CObject {
+public:
+    /// Called instead of the default deserialization for an object.
+    virtual void ReadObject(CObjectIStream& in,
+                            const CObjectInfo& object) = 0;
+};
+```
+
+Install with:
+
+```cpp
+is->SetPathReadObjectHook("Bioseq-set.seq-set.seq",
+    new CMyReadHook());
+```
+
+### CWriteObjectHook
+
+```cpp
+class CWriteObjectHook : public CObject {
+public:
+    /// Called instead of the default serialization for an object.
+    virtual void WriteObject(CObjectOStream&      out,
+                             const CConstObjectInfo& object) = 0;
+};
+```
+
+Install with:
+
+```cpp
+os->SetPathWriteObjectHook("Bioseq-set.seq-set.seq",
+    new CMyWriteHook());
+```
+
+### CReadClassMemberHook
+
+Called when a specific class member is encountered during deserialization. Useful for lazy loading of large members.
+
+```cpp
+class CReadClassMemberHook : public CObject {
+public:
+    virtual void ReadClassMember(CObjectIStream&        in,
+                                 const CObjectInfoMI&   member) = 0;
+};
+```
+
+### Example: filtering during read
+
+```cpp
+class CSkipSequencesHook : public CReadObjectHook {
+public:
+    void ReadObject(CObjectIStream& in,
+                    const CObjectInfo& object) override {
+        // Skip the object without constructing it
+        in.SkipObject(object.GetTypeInfo());
+    }
+};
+
+unique_ptr<CObjectIStream> is(
+    CObjectIStream::Open(eSerial_AsnText, "large.asn"));
+is->SetPathReadObjectHook("Bioseq-set.seq-set.seq",
+    new CSkipSequencesHook());
+
+CRef<CBioseq_set> bss(new CBioseq_set());
+*is >> *bss;
+```
+
+---
+
+## Complete read/write example
+
+```cpp
+#include <serial/objistr.hpp>
+#include <serial/objostr.hpp>
+#include <objects/seqset/Seq_entry.hpp>
+
+// Read ASN.1 text, write XML
+unique_ptr<CObjectIStream> in(
+    CObjectIStream::Open(eSerial_AsnText, "input.asn1"));
+
+unique_ptr<CObjectOStream> out(
+    CObjectOStream::Open(eSerial_Xml, "output.xml",
+                         0, fSerial_Xml_NoIndentation));
+
+CRef<CSeq_entry> entry(new CSeq_entry());
+*in  >> *entry;
+*out << *entry;
+```

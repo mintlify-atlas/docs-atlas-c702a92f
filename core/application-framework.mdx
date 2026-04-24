@@ -1,0 +1,354 @@
+---
+title: "NCBI C++ Toolkit Application Framework Guide"
+description: "Build structured NCBI applications using CNcbiApplication, argument parsing with CArgDescriptions and CArgs, and configuration via CNcbiRegistry."
+---
+
+Every NCBI C++ Toolkit program is built around a single application object that inherits from `CNcbiApplication`. This class enforces a singleton pattern — only one instance may exist at a time — and provides a well-defined lifecycle: setup in `Init()`, execution in `Run()`, and cleanup in `Exit()`. The framework automatically handles command-line parsing, configuration file loading, and diagnostic stream setup before your code ever runs.
+
+## Class Hierarchy
+
+`CNcbiApplication` is the concrete class your programs should subclass. It derives from `CNcbiApplicationAPI`, which holds all the core functionality and state:
+
+```
+std::exception
+    └── CNcbiApplicationAPI   (ncbiapp_api.hpp)
+            └── CNcbiApplication  (ncbiapp.hpp)
+```
+
+`CNcbiApplicationAPI` is abstract — `Run()` is a pure virtual method — so you must provide at minimum a `Run()` implementation. `Init()` and `Exit()` have default no-op implementations and are overridden as needed.
+
+<Note>
+Only one instance of `CNcbiApplication` is permitted per process. The `Instance()` static method returns a pointer to it. Attempting to construct a second instance throws `CAppException::eSecond`.
+</Note>
+
+## Application Lifecycle
+
+<Steps>
+
+<Step title="Construct and call AppMain()">
+In `main()`, construct your derived class and delegate to `AppMain()`, which drives the entire lifecycle:
+
+```cpp
+#include <corelib/ncbiapp.hpp>
+USING_NCBI_SCOPE;
+
+class CMyApp : public CNcbiApplication {
+public:
+    void Init() override;
+    int  Run()  override;
+    void Exit() override;
+};
+
+int NcbiSys_main(int argc, const char* argv[])
+{
+    return CMyApp().AppMain(argc, argv);
+}
+```
+
+`AppMain()` calls `Init()`, then `Run()`, then `Exit()`, and returns `Run()`'s exit code.
+</Step>
+
+<Step title="Describe arguments in Init()">
+Override `Init()` to register argument descriptions and set the application version:
+
+```cpp
+void CMyApp::Init()
+{
+    // Set version (major, minor, patch)
+    NCBI_APP_SET_VERSION(1, 0, 0);
+
+    // Build argument description object
+    unique_ptr<CArgDescriptions> arg_desc(new CArgDescriptions);
+    arg_desc->SetUsageContext(GetArguments().GetProgramName(),
+                              "Example NCBI application");
+
+    // Register arguments
+    arg_desc->AddKey("input", "InFile",
+                     "Path to the input FASTA file",
+                     CArgDescriptions::eInputFile);
+
+    arg_desc->AddOptionalKey("output", "OutFile",
+                             "Path to the output file (default: stdout)",
+                             CArgDescriptions::eOutputFile);
+
+    arg_desc->AddDefaultKey("format", "Format",
+                            "Output format: text or xml",
+                            CArgDescriptions::eString, "text");
+
+    arg_desc->AddFlag("verbose", "Enable verbose logging");
+
+    // Hand ownership to the framework
+    SetupArgDescriptions(arg_desc.release());
+}
+```
+</Step>
+
+<Step title="Read arguments and run logic in Run()">
+Override `Run()` to access parsed arguments via `GetArgs()`:
+
+```cpp
+int CMyApp::Run()
+{
+    const CArgs& args = GetArgs();
+
+    // Mandatory key — always has a value
+    CNcbiIstream& in = args["input"].AsInputFile();
+
+    // Optional key — check HasValue() before use
+    if (args["output"].HasValue()) {
+        CNcbiOstream& out = args["output"].AsOutputFile();
+    }
+
+    string fmt = args["format"].AsString();   // "text" or "xml"
+    bool   verbose = args["verbose"].AsBoolean();
+
+    // ... application logic ...
+
+    return 0;  // exit code
+}
+```
+</Step>
+
+<Step title="Release resources in Exit()">
+Override `Exit()` to perform cleanup after `Run()` returns. The framework guarantees `Exit()` is called even if `Run()` throws an exception:
+
+```cpp
+void CMyApp::Exit()
+{
+    // Close database connections, flush buffers, etc.
+}
+```
+</Step>
+
+</Steps>
+
+## Setting Application Name and Version
+
+<Tabs>
+
+<Tab title="Version macro">
+Use `NCBI_APP_SET_VERSION` inside the constructor or `Init()` to embed build metadata automatically:
+
+```cpp
+// In Init():
+NCBI_APP_SET_VERSION(2, 3, 1);
+// Produces: 2.3.1 annotated with TeamCity build info when available
+```
+</Tab>
+
+<Tab title="Manual SetVersion">
+Call `SetVersion()` directly if you need to construct the `CVersionInfo` object yourself:
+
+```cpp
+void CMyApp::Init()
+{
+    SetVersion(CVersionInfo(1, 4, 0));
+    // ...
+}
+```
+</Tab>
+
+</Tabs>
+
+The version string is printed when users pass `-version` or `-version-full` on the command line.
+
+## Registering Arguments with CArgDescriptions
+
+`CArgDescriptions` is the schema for your command line. Every argument must be described before `SetupArgDescriptions()` is called.
+
+### Argument kinds
+
+| Method | Syntax on command line | When required |
+|---|---|---|
+| `AddKey()` | `-name value` | Always required |
+| `AddOptionalKey()` | `[-name value]` | Optional, no default |
+| `AddDefaultKey()` | `[-name value]` | Optional with default |
+| `AddFlag()` | `-name` | Boolean flag, always optional |
+| `AddPositional()` | `value` | Positional, required |
+| `AddOptionalPositional()` | `[value]` | Positional, optional |
+
+### Argument types
+
+The `EType` enum controls parsing and validation:
+
+```cpp
+CArgDescriptions::eString      // arbitrary string
+CArgDescriptions::eInteger     // int
+CArgDescriptions::eInt8        // Int8 (64-bit)
+CArgDescriptions::eDouble      // double
+CArgDescriptions::eBoolean     // true/false/yes/no/1/0
+CArgDescriptions::eInputFile   // must exist and be readable
+CArgDescriptions::eOutputFile  // must be writable
+CArgDescriptions::eDirectory   // directory path
+CArgDescriptions::eDateTime    // date/time string
+```
+
+### Full AddKey signature
+
+```cpp
+void CArgDescriptions::AddKey(
+    const string& name,       // argument name (used as "-name" on cmdline)
+    const string& synopsis,   // short display name in USAGE
+    const string& comment,    // full description for -help
+    EType         type,       // value type
+    TFlags        flags = 0   // e.g. fAllowMultiple, fHidden
+);
+```
+
+### Full AddFlag signature
+
+```cpp
+void CArgDescriptions::AddFlag(
+    const string&          name,
+    const string&          comment,
+    CBoolEnum<EFlagValue>  set_value = eFlagHasValueIfSet,
+    TFlags                 flags = 0
+);
+```
+
+## Reading Values with CArgs
+
+`GetArgs()` returns a `const CArgs&`. Index it by argument name using `operator[]`:
+
+```cpp
+const CArgs& args = GetArgs();
+
+// Presence check for optional arguments
+if (args["count"].HasValue()) {
+    int n = args["count"].AsInteger();
+}
+
+// Type accessors
+const string& s  = args["name"].AsString();
+int           i  = args["count"].AsInteger();
+Int8          i8 = args["big"].AsInt8();
+double        d  = args["ratio"].AsDouble();
+bool          b  = args["flag"].AsBoolean();
+
+// File streams
+CNcbiIstream& fin  = args["in"].AsInputFile();
+CNcbiOstream& fout = args["out"].AsOutputFile();
+```
+
+<Warning>
+Calling a type accessor (e.g., `AsInteger()`) on an argument that was not declared with a compatible type throws `CArgException::eWrongCast`. Always use the accessor matching the `EType` specified in `AddKey()`.
+</Warning>
+
+Positional extra arguments are accessed by index:
+
+```cpp
+for (size_t i = 1; i <= args.GetNExtra(); ++i) {
+    string val = args[i].AsString();
+}
+```
+
+## Reading Configuration Files with CNcbiRegistry
+
+The framework automatically loads a `.ini` configuration file named after your executable (e.g., `myapp.ini`). Access it via `GetConfig()`:
+
+```cpp
+const CNcbiRegistry& reg = GetConfig();
+
+// Get a string value; empty string if not found
+string host = reg.Get("database", "host");
+
+// Get with default fallback
+string port = reg.GetString("database", "port", "5432");
+
+// Get typed values
+int    timeout = reg.GetInt   ("database", "timeout", 30);
+bool   debug   = reg.GetBool  ("network",  "debug",   false);
+double ratio   = reg.GetDouble("tuning",   "ratio",   1.0);
+```
+
+A typical `.ini` file uses `[section]` headers and `name=value` entries:
+
+```ini
+[database]
+host = mydb.ncbi.nlm.nih.gov
+port = 5432
+timeout = 60
+
+[network]
+debug = false
+```
+
+<Tip>
+Pass `-conffile path/to/app.ini` on the command line to override the default configuration file location. Pass `NULL` as the `conf` argument to `AppMain()` to disable automatic config loading altogether.
+</Tip>
+
+## Complete Working Example
+
+```cpp
+#include <corelib/ncbiapp.hpp>
+#include <corelib/ncbiargs.hpp>
+#include <corelib/ncbidiag.hpp>
+USING_NCBI_SCOPE;
+
+class CCounterApp : public CNcbiApplication
+{
+public:
+    void Init() override
+    {
+        NCBI_APP_SET_VERSION(1, 0, 0);
+
+        unique_ptr<CArgDescriptions> arg_desc(new CArgDescriptions);
+        arg_desc->SetUsageContext(GetArguments().GetProgramName(),
+                                  "Count lines in a file");
+
+        arg_desc->AddKey("in", "InputFile",
+                         "File to count lines in",
+                         CArgDescriptions::eInputFile);
+
+        arg_desc->AddDefaultKey("min", "MinLength",
+                                "Minimum line length to count",
+                                CArgDescriptions::eInteger, "0");
+
+        arg_desc->AddFlag("verbose", "Print each counted line");
+
+        SetupArgDescriptions(arg_desc.release());
+    }
+
+    int Run() override
+    {
+        const CArgs& args    = GetArgs();
+        CNcbiIstream& input  = args["in"].AsInputFile();
+        int           minLen = args["min"].AsInteger();
+        bool          verbose = args["verbose"].AsBoolean();
+
+        int    count = 0;
+        string line;
+        while (NcbiGetline(input, line, '\n')) {
+            if ((int)line.size() >= minLen) {
+                ++count;
+                if (verbose) {
+                    ERR_POST(Info << "Line " << count << ": " << line);
+                }
+            }
+        }
+
+        NcbiCout << "Total lines: " << count << NcbiEndl;
+        return 0;
+    }
+};
+
+int NcbiSys_main(int argc, const char* argv[])
+{
+    return CCounterApp().AppMain(argc, argv);
+}
+```
+
+<CardGroup cols={2}>
+  <Card title="Diagnostics and Logging" icon="circle-exclamation" href="/core/diagnostics-and-logging">
+    Learn how to use ERR_POST, LOG_POST, and severity levels in your application.
+  </Card>
+  <Card title="Exceptions" icon="triangle-exclamation" href="/core/exceptions">
+    Understand CException, NCBI_THROW, and how to define custom exception types.
+  </Card>
+  <Card title="Strings and Types" icon="font" href="/core/strings-and-types">
+    Explore the NStr utility class and NCBI portable integer types.
+  </Card>
+  <Card title="Memory and Smart Pointers" icon="memory" href="/core/memory-and-smart-pointers">
+    Use CRef and CObject for safe, reference-counted memory management.
+  </Card>
+</CardGroup>

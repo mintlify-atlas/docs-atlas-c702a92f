@@ -1,0 +1,76 @@
+---
+title: "NCBI C++ Toolkit: Purpose, Modules, and Architecture"
+description: "An overview of the NCBI C++ Toolkit's history, modular design, and the kinds of bioinformatics applications you can build with it."
+---
+
+The NCBI C++ Toolkit is a production-grade C++ library and application framework developed by the National Center for Biotechnology Information (NCBI), part of the U.S. National Library of Medicine. This page explains what the toolkit is, how its major modules relate to one another, and what you can build with it.
+
+## Background and purpose
+
+NCBI has developed and maintained the C++ Toolkit since the late 1990s as the foundation for its own production software, including BLAST, Entrez, and the Sequence Viewer. It was designed to give C++ developers a consistent, portable foundation for working with biological sequence data, NCBI databases, and NCBI web services — without having to build networking, serialization, and data-model infrastructure from scratch.
+
+The toolkit is a **United States Government Work** written by U.S. Government employees as part of their official duties. It cannot be copyrighted and is freely available to the public with no restriction on use or reproduction.
+
+## Module overview
+
+The toolkit is organized into loosely coupled modules. Each module exposes a public include directory under `include/` and is implemented under `src/`. The table below summarizes the major modules.
+
+| Module | Include path | Purpose |
+|---|---|---|
+| **corelib** | `include/corelib/` | Application framework, argument parsing, diagnostics, strings, smart pointers, threading primitives |
+| **connect** | `include/connect/` | Portable sockets, HTTP client, NCBI service connections, SSL |
+| **serial** | `include/serial/` | ASN.1, XML, and JSON serialization; code generation from ASN.1 specs |
+| **objects / objmgr** | `include/objects/`, `include/objmgr/` | Biological data-model classes (sequences, features, alignments) and the Object Manager for loading them from files or remote sources |
+| **algo/blast** | `include/algo/blast/` | The full BLAST sequence alignment engine and supporting data structures |
+| **dbapi** | `include/dbapi/` | Unified database API for MSSQL, Sybase, SQLite, and ODBC |
+| **cgi** | `include/cgi/` | CGI and FastCGI application framework |
+| **util** | `include/util/` | Compression, regular expressions, range utilities, and other generic containers |
+
+## Architecture
+
+The modules form a layered dependency graph. `corelib` sits at the base — almost every other module depends on it for the application framework, string utilities, and diagnostic infrastructure. `connect` builds on `corelib` to provide network I/O. `serial` uses `corelib` and `connect` to handle data encoding. `objects` and `objmgr` build on `serial` to provide typed access to NCBI biological data. `algo/blast` and the other algorithm libraries sit on top of `objmgr`.
+
+```
+algo/blast, algo/align, ...       ← high-level algorithms
+        |
+      objmgr                      ← sequence and annotation loading
+        |
+    objects + serial              ← data model + ASN.1/XML/JSON I/O
+        |
+  connect + dbapi                 ← network I/O + database access
+        |
+      corelib                     ← application framework, base types
+```
+
+Each layer is independently linkable. A simple command-line tool that only does string processing can link only `xncbi` (the corelib shared library). A BLAST search application links the full stack.
+
+## What you can build
+
+<CardGroup cols={2}>
+  <Card title="Bioinformatics command-line tools" icon="terminal" href="/quickstart">
+    Subclass `CNcbiApplication` and link `xncbi` to get argument parsing, diagnostics, and configuration management — the same framework used for all NCBI command-line tools.
+  </Card>
+  <Card title="BLAST search applications" icon="dna" href="/algorithms/blast">
+    Use the `algo/blast` module to run nucleotide and protein searches programmatically against local databases or remote NCBI BLAST services.
+  </Card>
+  <Card title="Sequence data processing pipelines" icon="database" href="/data/object-manager">
+    Load GenBank records from files or NCBI servers via the Object Manager, then iterate features, alignments, and annotations using typed C++ classes.
+  </Card>
+  <Card title="Web services and CGI applications" icon="globe" href="/network/cgi-framework">
+    Build CGI or FastCGI services that handle HTTP requests and return biological data in ASN.1, XML, or JSON using the `cgi` and `serial` modules.
+  </Card>
+  <Card title="Database-backed applications" icon="table" href="/data/database-api">
+    Connect to SQL databases with the unified `dbapi` interface, abstracting over Sybase, MSSQL, SQLite, and ODBC backends.
+  </Card>
+  <Card title="Networked client tools" icon="network-wired" href="/network/connections-and-sockets">
+    Use the `connect` module's socket and HTTP libraries to communicate with NCBI E-utilities, NCBI service dispatchers, or any HTTP/HTTPS endpoint.
+  </Card>
+</CardGroup>
+
+## License
+
+The NCBI C++ Toolkit is a **United States Government Work** under the terms of the United States Copyright Act (17 U.S.C. §105). It was written as part of the authors' official duties as U.S. Government employees and thus cannot be copyrighted. The software is freely available to the public with no restriction on use or reproduction. The National Library of Medicine and the U.S. Government disclaim all warranties, express or implied.
+
+<Note>
+Although the toolkit itself is public domain, some optional third-party components it can link against (such as OpenSSL, Boost, or PCRE) carry their own licenses. Check the licenses of any third-party dependencies you enable at configure time.
+</Note>

@@ -1,0 +1,558 @@
+---
+title: "NCBI C++ Toolkit Corelib: Application & String APIs"
+description: "Reference for CNcbiApplicationAPI, CArgDescriptions, CArgs, CArgValue, NStr, CObject, and CRef — core classes of the NCBI C++ Toolkit corelib."
+---
+
+The `corelib` module provides the backbone for every NCBI C++ Toolkit application: a structured application lifecycle (`CNcbiApplicationAPI`), a richly typed command-line argument system (`CArgDescriptions` / `CArgs`), reference-counted object ownership (`CObject` / `CRef<T>`), and a comprehensive string-utility namespace (`NStr`). Understanding these classes is essential before working with any higher-level toolkit component.
+
+---
+
+## CNcbiApplicationAPI
+
+`CNcbiApplicationAPI` (aliased as `CNcbiApplication`) is the abstract base class for all NCBI toolkit applications. Derive from it, implement `Run()`, and optionally override `Init()` and `Exit()`.
+
+```cpp
+#include <corelib/ncbiapp_api.hpp>
+
+class CMyApp : public CNcbiApplication {
+public:
+    void Init() override;
+    int  Run()  override;
+    void Exit() override;
+};
+
+int main(int argc, const char* argv[])
+{
+    return CMyApp().AppMain(argc, argv);
+}
+```
+
+### Lifecycle methods
+
+<Accordion title="Init()">
+
+```cpp
+virtual void Init(void);
+```
+
+Called once by `AppMain()` before `Run()`. Override to register argument descriptions and perform early setup. The default implementation does nothing.
+
+</Accordion>
+
+<Accordion title="Run()">
+
+```cpp
+virtual int Run(void) = 0;
+```
+
+Pure virtual. Must be implemented by every application. The return value is passed back as the process exit code.
+
+</Accordion>
+
+<Accordion title="Exit()">
+
+```cpp
+virtual void Exit(void);
+```
+
+Called once after `Run()` completes, even if `Run()` threw an exception. Override to release resources. The default implementation does nothing.
+
+</Accordion>
+
+<Accordion title="AppMain()">
+
+```cpp
+int AppMain(
+    int                argc,
+    const char* const* argv,
+    const char* const* envp  = 0,
+    EAppDiagStream     diag  = eDS_Default,
+    const char*        conf  = NcbiEmptyCStr,
+    const string&      name  = NcbiEmptyString
+);
+```
+
+Entry point; call from `main()`. Handles standard flags (`-h`, `-logfile`, `-version`), loads the `.ini` config file, and drives `Init()` → `Run()` → `Exit()`.
+
+<ParamField path="argc" type="int" required>
+Argument count from `main()`.
+</ParamField>
+<ParamField path="argv" type="const char* const*" required>
+Argument vector from `main()`.
+</ParamField>
+<ParamField path="envp" type="const char* const*">
+Environment pointer; pass `0` to use the system environment.
+</ParamField>
+<ParamField path="diag" type="EAppDiagStream">
+Where to write diagnostics (default `eDS_Default`).
+</ParamField>
+<ParamField path="conf" type="const char*">
+Path to config file or empty string for auto-detection.
+</ParamField>
+<ParamField path="name" type="const string&">
+Override the program display name used in diagnostics.
+</ParamField>
+
+<ResponseField name="return" type="int">
+Exit code from `Run()`, or a non-zero value if an exception escaped.
+</ResponseField>
+
+</Accordion>
+
+### Accessor methods
+
+<Accordion title="GetArgs()">
+
+```cpp
+virtual const CArgs& GetArgs(void) const;
+```
+
+Returns the parsed command-line arguments. Throws if `SetupArgDescriptions()` was never called.
+
+</Accordion>
+
+<Accordion title="GetConfig()">
+
+```cpp
+const CNcbiRegistry& GetConfig(void) const;
+```
+
+Returns a read-only reference to the application registry loaded from the `.ini` file.
+
+</Accordion>
+
+<Accordion title="GetProgramDisplayName()">
+
+```cpp
+const string& GetProgramDisplayName(void) const;
+```
+
+Returns the human-readable application name used in log messages and usage output.
+
+</Accordion>
+
+<Accordion title="SetVersion()">
+
+```cpp
+void SetVersion(const CVersionInfo& version);
+void SetVersion(const CVersionInfo& version, const SBuildInfo& build_info);
+```
+
+Sets the version information reported by `-version` and `-version-full`. Call from the constructor of the derived class.
+
+</Accordion>
+
+---
+
+## CArgDescriptions
+
+`CArgDescriptions` stores the description of all accepted command-line arguments. Pass an instance to `SetupArgDescriptions()` inside `Init()`.
+
+```cpp
+void Init() override {
+    auto args = make_unique<CArgDescriptions>();
+    args->SetUsageContext(GetArguments().GetProgramName(), "Example tool");
+    args->AddKey("in",  "InputFile",  "Input FASTA file",  CArgDescriptions::eInputFile);
+    args->AddOptionalKey("threads", "N", "Thread count", CArgDescriptions::eInteger);
+    args->AddFlag("verbose", "Enable verbose output");
+    SetupArgDescriptions(args.release());
+}
+```
+
+### AddKey()
+
+```cpp
+void AddKey(
+    const string& name,
+    const string& synopsis,
+    const string& comment,
+    EType         type,
+    TFlags        flags = 0
+);
+```
+
+Registers a mandatory key argument (`-name value`).
+
+<ParamField path="name" type="string" required>
+Argument name (alphanumeric, `-`, `_`).
+</ParamField>
+<ParamField path="synopsis" type="string" required>
+Short placeholder shown in usage (e.g. `"File"`).
+</ParamField>
+<ParamField path="comment" type="string" required>
+Description shown in help output.
+</ParamField>
+<ParamField path="type" type="EType" required>
+One of `eString`, `eInteger`, `eInt8`, `eDouble`, `eBoolean`, `eInputFile`, `eOutputFile`, `eDirectory`, `eDateTime`.
+</ParamField>
+<ParamField path="flags" type="TFlags">
+Optional flags such as `fAllowMultiple`, `fPreOpen`, `fBinary`.
+</ParamField>
+
+### AddOptionalKey()
+
+```cpp
+void AddOptionalKey(
+    const string& name,
+    const string& synopsis,
+    const string& comment,
+    EType         type,
+    TFlags        flags = 0
+);
+```
+
+Registers an optional key argument with no default value. The resulting `CArgValue` will have `HasValue() == false` if the argument was not provided.
+
+### AddDefaultKey()
+
+```cpp
+void AddDefaultKey(
+    const string& name,
+    const string& synopsis,
+    const string& comment,
+    EType         type,
+    const string& default_value,
+    TFlags        flags = 0,
+    const string& env_var = kEmptyStr,
+    const char*   display_value = nullptr
+);
+```
+
+Registers an optional key with a fallback default value.
+
+### AddFlag()
+
+```cpp
+void AddFlag(
+    const string&           name,
+    const string&           comment,
+    CBoolEnum<EFlagValue>   set_value = eFlagHasValueIfSet,
+    TFlags                  flags = 0
+);
+```
+
+Registers a boolean flag (`-name`). When present on the command line, `AsBoolean()` returns `true`.
+
+### AddPositional()
+
+```cpp
+void AddPositional(
+    const string& name,
+    const string& comment,
+    EType         type,
+    TFlags        flags = 0
+);
+```
+
+Registers a mandatory positional (unnamed) argument. Positional arguments are matched in declaration order.
+
+### AddExtra()
+
+```cpp
+void AddExtra(
+    unsigned      n_mandatory,
+    unsigned      n_optional,
+    const string& comment,
+    EType         type,
+    TFlags        flags = 0
+);
+```
+
+Registers extra positional arguments of uniform type. The values are accessible as `args["#1"]`, `args["#2"]`, etc.
+
+### SetUsageContext()
+
+```cpp
+void SetUsageContext(
+    const string& usage_name,
+    const string& usage_description,
+    bool          usage_sort_args = false,
+    SIZE_TYPE     usage_width = 78
+);
+```
+
+Sets the program name and description printed in help output.
+
+---
+
+## CArgs
+
+`CArgs` holds the parsed argument values after `AppMain()` calls `CreateArgs()` internally. Retrieve it from `GetArgs()`.
+
+### operator[]()
+
+```cpp
+const CArgValue& operator[](const string& name) const;
+const CArgValue& operator[](size_t idx)          const;
+```
+
+Looks up an argument by name or positional index (1-based for extras). Throws `CArgException` if the name does not exist.
+
+### Exist()
+
+```cpp
+bool Exist(const string& name) const;
+```
+
+Returns `true` if a description for `name` was registered. Does not check whether the argument was actually supplied.
+
+### IsEmpty()
+
+```cpp
+bool IsEmpty(void) const;
+```
+
+Returns `true` if the container holds no argument values.
+
+---
+
+## CArgValue
+
+`CArgValue` (derived from `CObject`) represents the value of a single parsed argument. Always obtained via `CArgs::operator[]()`.
+
+### Value-retrieval methods
+
+<Accordion title="AsString()">
+
+```cpp
+virtual const string& AsString(void) const = 0;
+```
+
+Returns the raw string value. For flags returns `"true"` or `"false"`.
+
+</Accordion>
+
+<Accordion title="AsInteger()">
+
+```cpp
+virtual int AsInteger(void) const = 0;
+```
+
+Returns the value as a 32-bit integer. Throws if the argument type is not `eInteger`.
+
+</Accordion>
+
+<Accordion title="AsInt8()">
+
+```cpp
+virtual Int8 AsInt8(void) const = 0;
+```
+
+Returns the value as a 64-bit integer. Works for both `eInteger` and `eInt8` typed arguments.
+
+</Accordion>
+
+<Accordion title="AsDouble()">
+
+```cpp
+virtual double AsDouble(void) const = 0;
+```
+
+Returns the value as a `double`. Throws if the argument type is not `eDouble`.
+
+</Accordion>
+
+<Accordion title="AsBoolean()">
+
+```cpp
+virtual bool AsBoolean(void) const = 0;
+```
+
+Returns the boolean value. Note: `HasValue()` / `operator bool()` check *presence*, not the actual boolean value.
+
+</Accordion>
+
+<Accordion title="AsInputFile() / AsOutputFile()">
+
+```cpp
+virtual CNcbiIstream& AsInputFile (TFileFlags flags = 0) const = 0;
+virtual CNcbiOstream& AsOutputFile(TFileFlags flags = 0) const = 0;
+```
+
+Opens and returns the associated stream. `TFileFlags` can include `fBinary`, `fAppend`, `fTruncate`. Only valid for user-defined file arguments.
+
+</Accordion>
+
+### HasValue()
+
+```cpp
+virtual bool HasValue(void) const = 0;
+```
+
+Returns `true` if the argument holds a value (either from the command line or from a default). Use this before calling `AsXxx()` on optional arguments.
+
+---
+
+## NStr — String Utilities
+
+`NStr` is a utility class (not instantiated) that provides static methods for type-safe string conversion and manipulation. Include `<corelib/ncbistr.hpp>`.
+
+### Numeric conversions
+
+<Accordion title="StringToInt / StringToInt8 / StringToDouble">
+
+```cpp
+static int    StringToInt    (const CTempString str,
+                               TStringToNumFlags flags = 0,
+                               int base = 10);
+static Int8   StringToInt8   (const CTempString str,
+                               TStringToNumFlags flags = 0,
+                               int base = 10);
+static double StringToDouble (const CTempStringEx str,
+                               TStringToNumFlags flags = 0);
+```
+
+Convert strings to numeric types. Pass `fConvErr_NoThrow` to return `0` on error instead of throwing.
+
+</Accordion>
+
+<Accordion title="IntToString / Int8ToString / DoubleToString">
+
+```cpp
+static string IntToString   (int value,
+                              TNumToStringFlags flags = 0,
+                              int base = 10);
+static string Int8ToString  (Int8 value,
+                              TNumToStringFlags flags = 0,
+                              int base = 10);
+static string DoubleToString(double value,
+                              int precision = -1,
+                              TNumToStringFlags flags = 0);
+```
+
+Convert numeric types to `std::string`.
+
+</Accordion>
+
+<Accordion title="NumericToString (template)">
+
+```cpp
+template<typename TNumeric>
+static string NumericToString(TNumeric value,
+                               TNumToStringFlags flags = 0,
+                               int base = 10);
+```
+
+Generic template that dispatches to the appropriate typed converter.
+
+</Accordion>
+
+<Accordion title="StringToBool / BoolToString">
+
+```cpp
+static bool         StringToBool(const CTempString str);
+static const string BoolToString(bool value);
+```
+
+`StringToBool` recognises `"true"`, `"t"`, `"yes"`, `"1"`, `"on"` (and their false counterparts), case-insensitively.
+
+</Accordion>
+
+---
+
+## CObject
+
+`CObject` is the intrusive reference-counted base class for most toolkit heap objects. It stores an atomic counter that tracks the number of `CRef<T>` instances pointing to it.
+
+```cpp
+#include <corelib/ncbiobj.hpp>
+
+class CMyData : public CObject {
+    // ...
+};
+CRef<CMyData> data(new CMyData());
+```
+
+### Reference-count methods
+
+<Accordion title="AddReference() / RemoveReference()">
+
+```cpp
+void AddReference(void) const;
+void RemoveReference(void) const noexcept;
+```
+
+Increment or decrement the reference count. `RemoveReference()` deletes the object when the count reaches zero and the object was allocated on the heap. Normally called automatically by `CRef<T>`.
+
+</Accordion>
+
+<Accordion title="Referenced() / ReferencedOnlyOnce()">
+
+```cpp
+bool Referenced(void) const noexcept;
+bool ReferencedOnlyOnce(void) const noexcept;
+```
+
+`Referenced()` returns `true` if at least one `CRef` points to the object. `ReferencedOnlyOnce()` returns `true` when exactly one `CRef` holds it — useful for copy-on-write patterns.
+
+</Accordion>
+
+---
+
+## CRef\<T\>
+
+`CRef<T>` is the standard smart pointer for `CObject`-derived types. It calls `AddReference()` / `RemoveReference()` automatically.
+
+```cpp
+CRef<CBioseq> seq(new CBioseq());
+CRef<CBioseq> seq2 = seq;           // shared ownership
+seq.Reset();                         // release this reference
+if (seq2.NotNull()) { /* use it */ }
+```
+
+### Constructors
+
+```cpp
+CRef(void) noexcept;                     // null reference
+explicit CRef(TObjectType* ptr);         // take ownership
+CRef(const CRef<T>& ref);               // copy (shared)
+CRef(CRef<T>&& ref) noexcept;           // move
+```
+
+### Key methods
+
+<Accordion title="Reset()">
+
+```cpp
+void Reset(void) noexcept;
+void Reset(TObjectType* newPtr);
+```
+
+Release the current reference (and possibly delete the object), then optionally acquire a new pointer.
+
+</Accordion>
+
+<Accordion title="IsNull() / NotNull()">
+
+```cpp
+bool IsNull(void)  const noexcept;
+bool NotNull(void) const noexcept;
+```
+
+Null checks. `operator!()` is equivalent to `IsNull()`.
+
+</Accordion>
+
+<Accordion title="GetPointer() / GetObject()">
+
+```cpp
+TObjectType*       GetPointer(void)       noexcept;
+const TObjectType* GetPointer(void) const noexcept;
+TObjectType&       GetObject(void);
+const TObjectType& GetObject(void) const;
+```
+
+`GetPointer()` returns `nullptr` for a null `CRef`. `GetObject()` throws `CNullPointerException` if the reference is null.
+
+</Accordion>
+
+<Accordion title="Release() / ReleaseOrNull()">
+
+```cpp
+TObjectType* Release(void);         // throws if null
+TObjectType* ReleaseOrNull(void);   // returns nullptr if null
+```
+
+Decrements the reference count and returns the raw pointer **without** deleting the object, transferring ownership to the caller.
+
+</Accordion>

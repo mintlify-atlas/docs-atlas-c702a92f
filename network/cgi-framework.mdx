@@ -1,0 +1,358 @@
+---
+title: "CGI and FastCGI Application Framework"
+description: "Build CGI and FastCGI web applications using CCgiApplication, CCgiContext, CCgiRequest, CCgiResponse, and CCgiSession from the NCBI cgi module."
+---
+
+The NCBI CGI framework wraps the low-level Common Gateway Interface protocol in a class hierarchy rooted at `CCgiApplication`. A single virtual method — `ProcessRequest()` — receives a fully parsed `CCgiContext` that carries the decoded request entries, cookies, and an output stream for the response. The same source can be compiled as either a classic one-shot CGI or a persistent FastCGI process with no code changes beyond linking to a different library.
+
+## CGI application lifecycle
+
+<Steps>
+  <Step title="Derive from CCgiApplication">
+    Subclass `CCgiApplication` and override the pure virtual `ProcessRequest()`. This is the only method that is mandatory.
+
+    ```cpp
+    #include <cgi/cgiapp.hpp>
+    #include <cgi/cgictx.hpp>
+    USING_NCBI_SCOPE;
+
+    class CMyApp : public CCgiApplication {
+    public:
+        int ProcessRequest(CCgiContext& ctx) override;
+    };
+    ```
+  </Step>
+  <Step title="Access the request">
+    Inside `ProcessRequest()`, retrieve the parsed request via `ctx.GetRequest()`. All URL query parameters and POST form entries are already decoded into a `TCgiEntries` multimap.
+
+    ```cpp
+    int CMyApp::ProcessRequest(CCgiContext& ctx)
+    {
+        CCgiRequest& req  = ctx.GetRequest();
+        CCgiResponse& resp = ctx.GetResponse();
+        // ...
+    }
+    ```
+  </Step>
+  <Step title="Read form data and URL parameters">
+    Use `GetEntry()` for named lookup or `GetEntries()` to iterate all entries. Both query-string and POST body parameters are merged into the same map.
+
+    ```cpp
+    bool found = false;
+    const CCgiEntry& id_entry = req.GetEntry("id", &found);
+    if (found) {
+        string id = id_entry.GetValue();
+    }
+    ```
+  </Step>
+  <Step title="Write the response">
+    Set the content type, call `WriteHeader()` exactly once, then write the body to `resp.out()`.
+
+    ```cpp
+    resp.SetContentType("text/plain");
+    resp.WriteHeader();
+    resp.out() << "Hello from CGI!\n";
+    ```
+  </Step>
+  <Step title="Return an exit code">
+    Return `0` on success or a non-zero value to signal an error. The framework catches uncaught exceptions and calls `OnException()`, which by default sends an HTTP 500 error page.
+
+    ```cpp
+        return 0;
+    }
+    ```
+  </Step>
+</Steps>
+
+## CCgiApplication — base class
+
+`CCgiApplication` inherits from `CNcbiApplication` and handles argument parsing, logging, CGI environment setup, and (when linked as FastCGI) the accept-process-repeat loop.
+
+| Virtual method | Purpose |
+|----------------|---------|
+| `Init()` | One-time initialization before any request is processed |
+| `ProcessRequest(ctx)` | **Must override.** Handle one HTTP request |
+| `OnException(e, os)` | Called when `ProcessRequest()` throws; default sends `500` |
+| `OnEvent(event, status)` | Called after each request or lifecycle event |
+| `LoadResource()` | Factory for the server's `CNcbiResource` |
+| `GetSessionStorage(params)` | Return a `ICgiSessionStorage` implementation for sessions |
+| `ValidateSynchronizationToken()` | CSRF token validation; default checks `Ncbi-CSRF-Token` header |
+
+```cpp
+// Minimal application entry point
+int main(int argc, const char* argv[])
+{
+    return CMyApp().AppMain(argc, argv);
+}
+```
+
+### IsFastCGI() and the iteration counter
+
+`IsFastCGI()` returns `true` when the process was invoked by a FastCGI server. `GetFCgiIteration()` returns the 1-based number of the request currently being processed (always `0` in plain CGI mode).
+
+## CCgiContext — the request wrapper
+
+`CCgiContext` is the single argument to `ProcessRequest()`. It owns the `CCgiRequest`, `CCgiResponse`, and `CCgiSession` for one request cycle.
+
+| Method | Return type | Description |
+|--------|-------------|-------------|
+| `GetRequest()` | `CCgiRequest&` | Decoded request entries, cookies, method |
+| `GetResponse()` | `CCgiResponse&` | Output headers and body stream |
+| `GetConfig()` | `CNcbiRegistry&` | Application INI configuration |
+| `GetSelfURL()` | `const string&` | Canonical URL of this CGI script |
+| `IsSecure()` | `bool` | `true` if request arrived over HTTPS |
+| `GetRequestValue(name)` | `const CCgiEntry&` | Shortcut for a named entry |
+
+## CCgiRequest — reading form data and URL parameters
+
+`CCgiRequest` decodes the CGI environment variables, query string, and (for POST requests with `application/x-www-form-urlencoded` or `multipart/form-data` content types) the request body.
+
+### GetEntries() and GetEntry()
+
+```cpp
+// Iterate all entries (GET + POST merged)
+const TCgiEntries& entries = req.GetEntries();
+for (const auto& kv : entries) {
+    cout << kv.first << " = " << kv.second.GetValue() << '\n';
+}
+
+// Look up a single entry by name
+bool found = false;
+const CCgiEntry& q = req.GetEntry("query", &found);
+if (found && !q.GetValue().empty()) {
+    string query_string = q.GetValue();
+}
+```
+
+### IsSetEntry helper
+
+There is no dedicated `IsSetEntry()` method; the idiomatic check uses the `bool* is_found` output parameter of `GetEntry()`:
+
+```cpp
+bool present = false;
+req.GetEntry("debug", &present);
+if (present) { /* debug flag was set */ }
+```
+
+### GetQueryString()
+
+The raw query string is available from the CGI property map:
+
+```cpp
+const string& qs = req.GetProperty(eCgi_QueryString);
+```
+
+### Request method
+
+```cpp
+CCgiRequest::ERequestMethod method = req.GetRequestMethod();
+if (method == CCgiRequest::eMethod_POST) {
+    // Handle POST-specific logic
+}
+```
+
+### On-demand parsing
+
+Pass `fParseInputOnDemand` to the request flags to avoid loading the entire POST body at once. Use `GetNextEntry()` in a loop to retrieve entries lazily:
+
+```cpp
+TCgiEntriesI it;
+while ((it = req.GetNextEntry()) != req.GetEntries().end()) {
+    cout << it->first << " => " << it->second.GetValue() << '\n';
+}
+```
+
+## CCgiResponse — writing headers and body
+
+`CCgiResponse` manages HTTP response headers, cookies, and the output stream.
+
+| Method | Description |
+|--------|-------------|
+| `SetContentType(type)` | Set the `Content-Type` header (default `text/html`) |
+| `SetStatus(code, reason)` | Set HTTP status, e.g. `SetStatus(404, "Not Found")` |
+| `SetHeaderValue(name, value)` | Add or replace an arbitrary header |
+| `WriteHeader()` | Flush headers to the output stream — call exactly once |
+| `out()` | Returns `CNcbiOstream&` for the response body |
+| `GetOutput()` | Raw `CNcbiOstream*`, may be `NULL` |
+| `Cookies()` | Access the outgoing `CCgiCookies` set |
+
+```cpp
+resp.SetContentType("application/json");
+resp.SetStatus(200);
+resp.WriteHeader();
+resp.out() << R"({"status":"ok"})";
+```
+
+<Warning>
+`WriteHeader()` must be called before writing any body content. The framework logs a warning if `ProcessRequest()` returns without having called it (this check is controlled by `RequireWriteHeader()`).
+</Warning>
+
+## Minimal CGI application example
+
+```cpp
+#include <cgi/cgiapp.hpp>
+#include <cgi/cgictx.hpp>
+#include <cgi/ncbicgi.hpp>
+#include <cgi/ncbicgir.hpp>
+USING_NCBI_SCOPE;
+
+class CGreetApp : public CCgiApplication
+{
+public:
+    int ProcessRequest(CCgiContext& ctx) override
+    {
+        CCgiRequest&  req  = ctx.GetRequest();
+        CCgiResponse& resp = ctx.GetResponse();
+
+        bool found = false;
+        string name = req.GetEntry("name", &found).GetValue();
+        if (!found || name.empty()) name = "World";
+
+        resp.SetContentType("text/html");
+        resp.WriteHeader();
+        resp.out() << "<html><body><h1>Hello, "
+                   << NStr::HtmlEncode(name)
+                   << "!</h1></body></html>\n";
+        return 0;
+    }
+};
+
+int main(int argc, const char* argv[])
+{
+    return CGreetApp().AppMain(argc, argv);
+}
+```
+
+Compile and install this binary as a CGI script. No other configuration is required for basic operation.
+
+## Processing form data
+
+For standard URL-encoded or multipart POST bodies, the framework parses the body automatically. Uploaded file entries expose additional metadata:
+
+```cpp
+const CCgiEntry& file_entry = req.GetEntry("uploaded_file", &found);
+if (found) {
+    string filename     = file_entry.GetFilename();
+    string content_type = file_entry.GetContentType();
+    // Stream access to file contents:
+    unique_ptr<CNcbiIstream> fs(file_entry.GetValueStream());
+}
+```
+
+## CGI session management — CCgiSession
+
+`CCgiSession` provides server-side session storage. To use it, override `GetSessionStorage()` in your application class and return a concrete implementation of `ICgiSessionStorage`.
+
+```cpp
+ICgiSessionStorage*
+CMyApp::GetSessionStorage(CCgiSessionParameters& params) const
+{
+    params.SetSessionCookieDomain(".example.com");
+    params.SetSessionIdName("mysessid");
+    return new CMySessionStorage();   // your ICgiSessionStorage impl
+}
+```
+
+Inside `ProcessRequest()`, access the session through the request:
+
+```cpp
+CCgiSession& sess = req.GetSession();  // creates if not present
+sess.SetAttribute("username", "alice");
+string user = sess.GetAttribute("username");
+```
+
+The session ID is propagated via a cookie (`ncbi_sessionid` by default). Pass `eDontCreateIfNotExist` to `GetSession()` if you only want to read an existing session without creating one.
+
+## HTML generation with the html module
+
+The NCBI `html` module provides a tree-based API for generating HTML without raw string manipulation. Include `<html/html.hpp>` and build a node tree:
+
+```cpp
+#include <html/html.hpp>
+USING_NCBI_SCOPE;
+
+CHTMLPage page("My Page");
+page.AppendChild(new CHTMLText("<p>Hello from the html module</p>"));
+page.Print(resp.out(), CNCBINode::eHTML);
+```
+
+## FastCGI support
+
+### CGI vs FastCGI deployment
+
+| Aspect | CGI | FastCGI |
+|--------|-----|---------|
+| Process lifetime | One request per process | Persistent; handles many requests |
+| Startup cost | Paid on every request | Paid once at startup |
+| `Init()` call | Once per process (= per request) | Once at startup |
+| `GetFCgiIteration()` | Always `0` | `1`, `2`, ... |
+| `IsFastCGI()` | Returns `false` | Returns `true` |
+
+### Building as FastCGI
+
+Link your application against `xfcgi` (single-threaded) or `xfcgi_mt` (multi-threaded) instead of the plain CGI library. The same `CCgiApplication` subclass works with no source changes.
+
+```bash
+# Single-threaded FastCGI
+g++ myapp.cpp -lxfcgi -lncbi_core -o myapp.fcgi
+
+# Multi-threaded FastCGI (CFastCgiApplicationMT)
+g++ myapp.cpp -lxfcgi_mt -lncbi_core -o myapp.fcgi
+```
+
+The FastCGI loop runs `ProcessRequest()` for each incoming connection, then waits for the next one. `FASTCGI_ScheduleExit()` requests a graceful shutdown after the current request completes.
+
+### Iteration limits and watch files
+
+Configure `[FastCGI]` section in the INI file to control restart behavior:
+
+```ini
+[FastCGI]
+Iterations = 1000        ; exit after 1000 requests
+WatchFile  = /tmp/restart.flag  ; exit if this file changes
+StopIfFailed = false     ; keep running even if a request throws
+```
+
+<Tip>
+For multi-threaded FastCGI (`CFastCgiApplicationMT`), override `CreateRequestProcessor()` to return a per-thread `CCgiRequestProcessor` subclass. Each thread receives its own processor instance, keeping per-request state isolated.
+</Tip>
+
+### OnEvent() lifecycle hook
+
+`OnEvent()` is called after each event in the CGI/FastCGI lifecycle:
+
+| Event | When called |
+|-------|-------------|
+| `eStartRequest` | Before `ProcessRequest()` |
+| `eSuccess` | After `ProcessRequest()` returns `0` |
+| `eError` | After `ProcessRequest()` returns non-zero |
+| `eException` | After `OnException()` is called |
+| `eEndRequest` | After all output is flushed |
+| `eWaiting` | Periodically while waiting for the next FastCGI request |
+| `eExit` | Just before the process exits |
+
+```cpp
+void CMyApp::OnEvent(EEvent event, int status)
+{
+    if (event == eEndRequest) {
+        // Log request completion metrics
+    }
+}
+```
+
+## CORS support
+
+Cross-origin resource sharing headers are managed by `CCgiContext::ProcessCORSRequest()`:
+
+```cpp
+int CMyApp::ProcessRequest(CCgiContext& ctx) override
+{
+    // Handle preflight OPTIONS and add CORS headers
+    if (CCgiContext::ProcessCORSRequest(ctx.GetRequest(),
+                                        ctx.GetResponse())) {
+        return 0;  // preflight handled; no further processing needed
+    }
+    // Normal request handling...
+    return 0;
+}
+```

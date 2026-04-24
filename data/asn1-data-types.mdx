@@ -1,0 +1,293 @@
+---
+title: "NCBI ASN.1 Biological Data Types and Generated Classes"
+description: "A guide to the NCBI biological data model: CSeq_entry, CBioseq, CSeq_feat, CSeq_align, CSeq_id, and how generated C++ classes map to ASN.1 definitions."
+---
+
+NCBI maintains a formal data model for biological sequences expressed in ASN.1 module notation. The `datatool` code generator reads these modules and produces C++ classes that mirror the ASN.1 structure. This page covers the most important generated types, explains the accessor patterns they all share, and shows how to build and traverse data objects in code.
+
+## NCBI data model overview
+
+The biological data model is organized hierarchically. At the top is `CSeq_entry`, which can hold either a single sequence (`CBioseq`) or a set of sequences (`CBioseq_set`). Annotations (`CSeq_annot`) carrying features, alignments, and graphs are attached to entries throughout the hierarchy.
+
+```
+CSeq_entry
+├── CBioseq               (single sequence)
+│   ├── [CSeq_id, ...]    (identifiers)
+│   ├── CSeq_inst         (sequence data and metadata)
+│   └── [CSeq_annot, ...] (annotations)
+└── CBioseq_set           (collection of sequences)
+    ├── [CSeq_entry, ...]
+    └── [CSeq_annot, ...]
+```
+
+Generated classes live under `include/objects/` in subdirectories that correspond to ASN.1 modules:
+
+| Directory | Module | Key types |
+|-----------|--------|-----------|
+| `objects/seq/` | `NCBI-Sequence` | `CBioseq`, `CSeq_inst`, `CSeq_annot` |
+| `objects/seqset/` | `NCBI-Seqset` | `CSeq_entry`, `CBioseq_set` |
+| `objects/seqloc/` | `NCBI-Seqloc` | `CSeq_id`, `CSeq_loc`, `CSeq_interval` |
+| `objects/seqfeat/` | `NCBI-Seqfeat` | `CSeq_feat`, `CSeqFeatData`, `CGene_ref` |
+| `objects/seqalign/` | `NCBI-Seqalign` | `CSeq_align`, `CDense_seg` |
+
+## Common accessor patterns
+
+Every generated class follows the same naming convention for field access. For a field named `Foo`:
+
+| Method | Meaning |
+|--------|---------|
+| `IsSetFoo()` | Returns `true` if the field has been assigned |
+| `CanGetFoo()` | Returns `true` if the field can be read (`IsSetFoo()` or has a default) |
+| `GetFoo()` | Returns a `const` reference to the field value |
+| `SetFoo(value)` | Sets the field; returns a non-const reference (for compound types) |
+| `SetFoo()` | Returns a non-const reference, creating the field if absent |
+| `ResetFoo()` | Clears the field back to unset |
+
+Choice types (ASN.1 `CHOICE`) add:
+
+| Method | Meaning |
+|--------|---------|
+| `Which()` | Returns the active variant as an enum |
+| `Select(variant)` | Activates a specific variant |
+
+<Note>
+Always call `IsSetFoo()` before `GetFoo()` for optional fields. Calling `GetFoo()` on an unset field throws `CUnassignedMember`.
+</Note>
+
+## CSeq_entry and CBioseq_set
+
+`CSeq_entry` is the fundamental container. It is a choice between a single bioseq and a bioseq set.
+
+```cpp
+#include <objects/seqset/Seq_entry.hpp>
+#include <objects/seq/Bioseq.hpp>
+#include <objects/seqset/Bioseq_set.hpp>
+
+CRef<CSeq_entry> entry(new CSeq_entry);
+
+// Make it hold a single bioseq
+CBioseq& bioseq = entry->SetSeq();
+
+// Or a set
+CBioseq_set& bset = entry->SetSet();
+
+// Check which variant is active
+if (entry->IsSeq()) {
+    const CBioseq& seq = entry->GetSeq();
+} else if (entry->IsSet()) {
+    const CBioseq_set& s = entry->GetSet();
+    for (const auto& sub : s.GetSeq_set()) {
+        // recurse into sub-entries
+    }
+}
+```
+
+## CBioseq: sequence data container
+
+`CBioseq` holds identifiers, descriptors, and instance data.
+
+```cpp
+#include <objects/seq/Bioseq.hpp>
+#include <objects/seq/Seq_inst.hpp>
+
+CRef<CBioseq> bioseq(new CBioseq);
+
+// Add an identifier
+CRef<CSeq_id> sid(new CSeq_id);
+sid->SetGenbank().SetAccession("U00001");
+sid->SetGenbank().SetVersion(1);
+bioseq->SetId().push_back(sid);
+
+// Set instance metadata
+CSeq_inst& inst = bioseq->SetInst();
+inst.SetRepr(CSeq_inst::eRepr_raw);
+inst.SetMol(CSeq_inst::eMol_dna);
+inst.SetLength(2532);
+inst.SetStrand(CSeq_inst::eStrand_ds);
+```
+
+## CSeq_feat: biological feature
+
+`CSeq_feat` describes a biological annotation on a specific sequence location. The feature data is a choice type (`CSeqFeatData`) that selects the feature type.
+
+```cpp
+#include <objects/seqfeat/Seq_feat.hpp>
+#include <objects/seqfeat/SeqFeatData.hpp>
+#include <objects/seqfeat/Gene_ref.hpp>
+#include <objects/seqloc/Seq_loc.hpp>
+
+CRef<CSeq_feat> feat(new CSeq_feat);
+
+// Set feature type: gene
+feat->SetData().SetGene().SetLocus("recA");
+feat->SetData().SetGene().SetLocus_tag("b2699");
+
+// Set location: interval on sequence U00001.1 positions 1000-2000
+CRef<CSeq_loc> loc(new CSeq_loc);
+loc->SetInt().SetFrom(1000);
+loc->SetInt().SetTo(2000);
+loc->SetInt().SetStrand(eNa_strand_plus);
+CRef<CSeq_id> id(new CSeq_id("gb|U00001.1"));
+loc->SetInt().SetId(*id);
+feat->SetLocation(*loc);
+
+// Optional comment
+feat->SetComment("DNA repair recombinase");
+
+// Check whether a field is set
+if (feat->IsSetComment()) {
+    NcbiCout << feat->GetComment() << NcbiEndl;
+}
+```
+
+Common feature subtypes in `CSeqFeatData::ESubtype`:
+
+| Enum | Feature type |
+|------|-------------|
+| `eSubtype_gene` | Gene |
+| `eSubtype_cdregion` | Coding region (CDS) |
+| `eSubtype_mRNA` | mRNA |
+| `eSubtype_exon` | Exon |
+| `eSubtype_prot` | Protein |
+| `eSubtype_misc_feature` | Miscellaneous feature |
+
+## CSeq_align: sequence alignment
+
+`CSeq_align` encodes pairwise or multiple sequence alignments. The alignment data is a choice between several representations; `CDense_seg` is most common for ungapped alignments.
+
+```cpp
+#include <objects/seqalign/Seq_align.hpp>
+#include <objects/seqalign/Dense_seg.hpp>
+
+CRef<CSeq_align> aln(new CSeq_align);
+aln->SetType(CSeq_align::eType_global);
+
+CDense_seg& dseg = aln->SetSegs().SetDenseg();
+dseg.SetDim(2);    // pairwise
+dseg.SetNumseg(3); // three segments
+
+// Ids, starts, lens populated ...
+
+if (aln->GetSegs().IsDenseg()) {
+    const CDense_seg& ds = aln->GetSegs().GetDenseg();
+    NcbiCout << "Segments: " << ds.GetNumseg() << NcbiEndl;
+}
+```
+
+## CSeq_annot: annotation container
+
+`CSeq_annot` bundles related annotations (features, alignments, or graphs) into a named, trackable unit.
+
+```cpp
+#include <objects/seq/Seq_annot.hpp>
+
+CRef<CSeq_annot> annot(new CSeq_annot);
+annot->SetNameDesc("my_gene_features");
+
+// Add feature objects
+annot->SetData().SetFtable().push_back(feat);
+```
+
+## CSeq_id and sequence identifiers
+
+`CSeq_id` is a central choice type that covers all NCBI and third-party identifier namespaces.
+
+```cpp
+#include <objects/seqloc/Seq_id.hpp>
+
+// GenBank accession.version
+CRef<CSeq_id> gb_id(new CSeq_id);
+gb_id->SetGenbank().SetAccession("NM_001234");
+gb_id->SetGenbank().SetVersion(5);
+
+// GI number (integer)
+CRef<CSeq_id> gi_id(new CSeq_id);
+gi_id->SetGi(GI_CONST(12345678));
+
+// RefSeq
+CRef<CSeq_id> ref_id(new CSeq_id("ref|NP_000001.1"));
+
+// Local identifier
+CRef<CSeq_id> local_id(new CSeq_id);
+local_id->SetLocal().SetStr("my_custom_id");
+
+// Check the active variant
+switch (gi_id->Which()) {
+    case CSeq_id::e_Gi:
+        NcbiCout << "GI: " << gi_id->GetGi() << NcbiEndl;
+        break;
+    case CSeq_id::e_Genbank:
+        NcbiCout << "Accession: "
+                 << gi_id->GetGenbank().GetAccession() << NcbiEndl;
+        break;
+    default:
+        break;
+}
+```
+
+### Common CSeq_id variants
+
+| Enum | Namespace |
+|------|-----------|
+| `CSeq_id::e_Genbank` | GenBank (DDBJ, EMBL) |
+| `CSeq_id::e_Gi` | NCBI integer GI |
+| `CSeq_id::e_Refseq` | RefSeq |
+| `CSeq_id::e_Swissprot` | Swiss-Prot / UniProt |
+| `CSeq_id::e_Pdb` | PDB |
+| `CSeq_id::e_Local` | Application-local |
+| `CSeq_id::e_General` | Arbitrary database tag |
+
+## Building a complete data tree
+
+```cpp
+#include <objects/seqset/Seq_entry.hpp>
+#include <objects/seq/Bioseq.hpp>
+#include <objects/seq/Seq_inst.hpp>
+#include <objects/seqloc/Seq_id.hpp>
+#include <objects/seq/Seq_data.hpp>
+#include <objects/seqfeat/Seq_feat.hpp>
+#include <objects/seq/Seq_annot.hpp>
+#include <serial/objostr.hpp>
+#include <serial/serial.hpp>
+
+USING_SCOPE(ncbi);
+USING_SCOPE(objects);
+
+// 1. Build identifier
+CRef<CSeq_id> id(new CSeq_id);
+id->SetLocal().SetStr("demo_seq");
+
+// 2. Build bioseq
+CRef<CBioseq> bioseq(new CBioseq);
+bioseq->SetId().push_back(id);
+
+CSeq_inst& inst = bioseq->SetInst();
+inst.SetRepr(CSeq_inst::eRepr_raw);
+inst.SetMol(CSeq_inst::eMol_dna);
+inst.SetLength(20);
+inst.SetSeq_data().SetIupacna().Set("ATGCATGCATGCATGCATGC");
+
+// 3. Build a gene annotation
+CRef<CSeq_feat> feat(new CSeq_feat);
+feat->SetData().SetGene().SetLocus("demoGene");
+CRef<CSeq_loc> loc(new CSeq_loc);
+loc->SetWhole(*id);
+feat->SetLocation(*loc);
+
+CRef<CSeq_annot> annot(new CSeq_annot);
+annot->SetData().SetFtable().push_back(feat);
+bioseq->SetAnnot().push_back(annot);
+
+// 4. Wrap in Seq-entry
+CRef<CSeq_entry> entry(new CSeq_entry);
+entry->SetSeq(*bioseq);
+
+// 5. Serialize to ASN.1 text
+unique_ptr<CObjectOStream> out(
+    CObjectOStream::Open(eSerial_AsnText, cout, eNoOwnership));
+*out << *entry;
+```
+
+<Tip>
+The macro headers (e.g., `seq_macros.hpp`, `seqfeat_macros.hpp`) provide `FOR_EACH_*` and `EDIT_EACH_*` macros that simplify traversal of generated container types without writing raw iterator loops.
+</Tip>

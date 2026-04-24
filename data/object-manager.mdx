@@ -1,0 +1,256 @@
+---
+title: "Object Manager: Accessing Biological Sequence Data"
+description: "Learn how the NCBI Object Manager manages biological sequence data with lazy loading, caching, and data loaders via CScope, CBioseq_Handle, and CFeat_CI."
+---
+
+The Object Manager library provides a unified interface for accessing biological sequence data regardless of where that data lives — in memory, in a local file, or fetched on demand from NCBI databases. It handles caching and lazy loading transparently so that application code works with lightweight handle objects and only materializes actual sequence data when it is needed.
+
+## Core concepts
+
+The Object Manager architecture revolves around three cooperating classes:
+
+- **`CObjectManager`** — the process-wide singleton that owns data loaders and acts as a factory for scopes.
+- **`CScope`** — a working context that collects data sources and resolves sequence identifiers. Most application code interacts primarily with `CScope`.
+- **`CBioseq_Handle`** — a lightweight, copyable proxy to a specific biological sequence loaded into a scope.
+
+<CardGroup cols={2}>
+  <Card title="CObjectManager" icon="database">
+    Singleton that registers data loaders and manages shared data sources across all scopes in the process.
+  </Card>
+  <Card title="CScope" icon="layers">
+    The per-task working context. Add data loaders or explicit entries, then resolve sequences by ID.
+  </Card>
+  <Card title="CBioseq_Handle" icon="dna">
+    A copy-safe proxy to sequence data. Gives access to sequence vectors, annotations, and metadata.
+  </Card>
+  <Card title="CFeat_CI" icon="list">
+    An iterator over `CSeq_feat` objects associated with a bioseq or genomic location.
+  </Card>
+</CardGroup>
+
+## CObjectManager singleton
+
+`CObjectManager` is obtained through a static factory method. The same instance is returned on every call within a process.
+
+```cpp
+#include <objmgr/object_manager.hpp>
+
+CRef<CObjectManager> om = CObjectManager::GetInstance();
+```
+
+### Registering data loaders
+
+Data loaders fetch sequences on demand from external sources. Each loader type provides a static `RegisterInObjectManager()` method that installs the loader and returns a `SRegisterLoaderInfo<TLoader>` struct describing whether the loader was newly created.
+
+```cpp
+// Example: register the GenBank data loader (from ncbi_xloader_genbank)
+CGBDataLoader::RegisterInObjectManager(*om, CGBDataLoader::eDefault);
+```
+
+The `EIsDefault` flag controls whether the loader is automatically included when `CScope::AddDefaults()` is called:
+
+| Flag | Meaning |
+|------|---------|
+| `CObjectManager::eDefault` | Included by `AddDefaults()` |
+| `CObjectManager::eNonDefault` | Must be added to a scope explicitly |
+
+Priority constants (`kPriority_Entry`, `kPriority_Loader`, etc.) control the order in which competing data sources are consulted; lower numbers are searched first.
+
+## CScope: the working context
+
+`CScope` resolves sequence identifiers against its registered data sources. Create one per task or per thread; it is not shared between threads.
+
+```cpp
+#include <objmgr/scope.hpp>
+
+CRef<CObjectManager> om = CObjectManager::GetInstance();
+CScope scope(*om);
+scope.AddDefaults(); // adds all loaders registered as eDefault
+```
+
+### Key methods
+
+| Method | Description |
+|--------|-------------|
+| `AddDefaults()` | Adds all data loaders registered as `eDefault` |
+| `AddDataLoader(name)` | Adds a specific named loader |
+| `AddTopLevelSeqEntry(entry)` | Injects an in-memory `CSeq_entry` directly |
+| `GetBioseqHandle(id)` | Looks up a sequence by `CSeq_id` or `CSeq_id_Handle` |
+| `GetSequenceLength(id)` | Fast length query, no full load required |
+| `GetTaxId(id)` | Taxonomy ID without loading the full sequence |
+| `ResetHistory()` | Releases cached TSEs not referenced by live handles |
+
+### Adding explicit in-memory data
+
+When sequence data is already available as an object tree, add it directly to the scope instead of going through a loader:
+
+```cpp
+CRef<CSeq_entry> entry = /* ... build or read entry ... */;
+scope.AddTopLevelSeqEntry(*entry);
+```
+
+## CBioseq_Handle: sequence proxy
+
+`CBioseq_Handle` is a lightweight, copy-safe object returned by `CScope::GetBioseqHandle()`. It holds a reference into the scope's internal cache and prevents the associated data from being evicted while the handle is alive.
+
+```cpp
+CSeq_id id;
+id.SetGenbank().SetAccession("U00001");
+id.SetGenbank().SetVersion(1);
+
+CBioseq_Handle bsh = scope.GetBioseqHandle(id);
+if (!bsh) {
+    // sequence not found
+}
+```
+
+### Useful accessors
+
+| Method | Returns |
+|--------|---------|
+| `GetSeqId()` | A preferred `CSeq_id` for this bioseq |
+| `GetSeq_id_Handle()` | The handle used to fetch this bioseq |
+| `GetCompleteBioseq()` | `CConstRef<CBioseq>` with all fields populated |
+| `GetBioseqLength()` | Length in residues (calculated if not set) |
+| `GetSequenceType()` | `CSeq_inst::TMol` (na, aa, rna, …) |
+| `IsNucleotide()` / `IsProtein()` | Convenience type checks |
+| `GetSeqVector(coding)` | A `CSeqVector` for raw sequence access |
+| `GetState()` | Bitfield of `EBioseqStateFlags` (suppressed, dead, …) |
+
+## CSeqVector: accessing sequence characters
+
+`CSeqVector` presents the sequence as a random-access array of residue characters. Obtain one from a handle by specifying the desired coding:
+
+```cpp
+CSeqVector sv = bsh.GetSeqVector(CBioseq_Handle::eCoding_Iupac);
+sv.SetIupacCoding(); // ensures IUPACNA / IUPACAA output
+
+// Random access
+char base = sv[42]; // 0-based
+
+// Extract a substring
+string region;
+sv.GetSeqData(100, 200, region); // positions [100, 200)
+
+// Iterator
+for (CSeqVector::const_iterator it = sv.begin(); it != sv.end(); ++it) {
+    char residue = *it;
+}
+```
+
+Coding options:
+
+| Enum | Effect |
+|------|--------|
+| `eCoding_NotSet` | Use whatever coding is stored (may vary) |
+| `eCoding_Ncbi` | Binary NCBI coding (Ncbi4na / Ncbistdaa) |
+| `eCoding_Iupac` | Human-readable IUPAC coding |
+
+## Feature iteration with CFeat_CI
+
+`CFeat_CI` iterates over `CSeq_feat` objects associated with a bioseq or a genomic location. Each element is a `CMappedFeat` that gives access to both the original feature and its mapped coordinates.
+
+```cpp
+#include <objmgr/feat_ci.hpp>
+
+// Iterate all features on the sequence
+for (CFeat_CI it(bsh); it; ++it) {
+    const CSeq_feat& feat = it->GetOriginalFeature();
+    // it->GetData().GetSubtype() — feature subtype
+    // it->GetLocation()          — mapped location
+}
+```
+
+### Filtering with SAnnotSelector
+
+```cpp
+#include <objmgr/annot_selector.hpp>
+
+SAnnotSelector sel;
+sel.SetFeatType(CSeqFeatData::e_Gene);   // only gene features
+sel.SetResolveAll();                      // resolve through segments
+
+for (CFeat_CI it(bsh, sel); it; ++it) {
+    // process gene features
+}
+```
+
+## Data loaders concept
+
+When `CScope::GetBioseqHandle()` cannot find a sequence in memory, it queries each registered data loader in priority order. A loader fetches the minimal required data — just the sequence metadata, or also the sequence data, or also annotations — and caches it in a Top-level Seq-entry (TSE). Subsequent access to the same sequence reuses the cached TSE.
+
+<Note>
+Data loaders operate lazily. Calling `GetBioseqHandle()` may trigger a network request, but `GetSequenceLength()` or `GetTaxId()` often resolve from metadata alone without fetching full sequence data.
+</Note>
+
+## Complete usage example
+
+<Steps>
+  <Step title="Get the Object Manager">
+    Retrieve the singleton and register the loaders your application needs.
+
+    ```cpp
+    #include <objmgr/object_manager.hpp>
+    #include <objmgr/scope.hpp>
+    #include <objmgr/bioseq_handle.hpp>
+    #include <objmgr/feat_ci.hpp>
+    #include <objmgr/seq_vector.hpp>
+    #include <objects/seqloc/Seq_id.hpp>
+    #include <objects/seqfeat/SeqFeatData.hpp>
+
+    USING_SCOPE(ncbi);
+    USING_SCOPE(objects);
+
+    CRef<CObjectManager> om = CObjectManager::GetInstance();
+    // Register GenBank loader as default (requires ncbi_xloader_genbank)
+    CGBDataLoader::RegisterInObjectManager(*om, CGBDataLoader::eDefault);
+    ```
+  </Step>
+
+  <Step title="Create a scope and look up a sequence">
+    ```cpp
+    CScope scope(*om);
+    scope.AddDefaults();
+
+    // Build a Seq-id for GenBank accession U00001.1
+    CRef<CSeq_id> seq_id(new CSeq_id("gb|U00001.1"));
+    CBioseq_Handle bsh = scope.GetBioseqHandle(*seq_id);
+
+    if (!bsh) {
+        ERR_POST("Sequence not found");
+        return 1;
+    }
+
+    NcbiCout << "Length: " << bsh.GetBioseqLength() << NcbiEndl;
+    ```
+  </Step>
+
+  <Step title="Read sequence characters">
+    ```cpp
+    CSeqVector sv = bsh.GetSeqVector(CBioseq_Handle::eCoding_Iupac);
+
+    string first100;
+    sv.GetSeqData(0, min((TSeqPos)100, sv.size()), first100);
+    NcbiCout << "First 100 bases: " << first100 << NcbiEndl;
+    ```
+  </Step>
+
+  <Step title="Iterate features">
+    ```cpp
+    SAnnotSelector sel;
+    sel.SetFeatType(CSeqFeatData::e_Cdregion);
+
+    int cds_count = 0;
+    for (CFeat_CI it(bsh, sel); it; ++it) {
+        ++cds_count;
+        const CSeq_loc& loc = it->GetLocation();
+        NcbiCout << "CDS at: " << MSerial_AsnText << loc << NcbiEndl;
+    }
+    NcbiCout << "Total CDS features: " << cds_count << NcbiEndl;
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+`CBioseq_Handle` and `CFeat_CI` hold internal references into the scope's cache. Keep the originating `CScope` alive for at least as long as any handles derived from it. Destroying the scope while handles are alive results in undefined behavior.
+</Warning>

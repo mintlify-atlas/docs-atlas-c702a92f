@@ -1,0 +1,344 @@
+---
+title: "NCBI String Utilities, CTempString, and Portable Types"
+description: "Master NStr string utilities, the zero-copy CTempString view, and NCBI guaranteed-width integer types for portable bioinformatics code."
+---
+
+The NCBI C++ Toolkit provides a rich set of string utilities through the `NStr` namespace class, a lightweight non-owning string view called `CTempString`, and a complete set of fixed-width integer types that are guaranteed to be the right size on every supported platform. Together these facilities let you write code that is both safe and efficient across the wide variety of compilers and operating systems NCBI targets.
+
+## The NStr Utility Class
+
+`NStr` (declared in `<corelib/ncbistr.hpp>`) is a class whose static methods cover almost every common string operation: case conversion, trimming, splitting, joining, numeric conversion, and searching. All methods that accept string arguments use `CTempString` to avoid unnecessary copies.
+
+### Case Conversion
+
+```cpp
+#include <corelib/ncbistr.hpp>
+USING_NCBI_SCOPE;
+
+// In-place modification of std::string
+string s = "Hello World";
+NStr::ToLower(s);   // s == "hello world"
+NStr::ToUpper(s);   // s == "HELLO WORLD"
+
+// char* variants (modifies in place, returns same pointer)
+char buf[] = "Hello";
+NStr::ToLower(buf); // buf == "hello"
+```
+
+Signature from `ncbistr.hpp`:
+```cpp
+static string& ToLower(string& str);
+static char*   ToLower(char*   str);
+static string& ToUpper(string& str);
+static char*   ToUpper(char*   str);
+```
+
+<Note>
+`ToLower(const char*)` and `ToUpper(const char*)` are intentionally deleted — passing a string literal is a compile-time error. This prevents accidental attempts to modify read-only memory.
+</Note>
+
+### Whitespace Trimming
+
+```cpp
+string padded = "  hello  ";
+
+// Returns new std::string, trimmed on both ends
+string trimmed = NStr::TruncateSpaces(padded);
+// trimmed == "hello"
+
+// Returns a CTempString view (zero-copy) — no allocation
+CTempString view = NStr::TruncateSpaces(CTempString(padded));
+
+// In-place modification
+NStr::TruncateSpacesInPlace(padded);
+```
+
+The `ETrunc` enum controls which end(s) to trim:
+```cpp
+NStr::eTrunc_Begin  // trim leading spaces only
+NStr::eTrunc_End    // trim trailing spaces only
+NStr::eTrunc_Both   // trim both (default)
+```
+
+### Numeric Conversion
+
+<Tabs>
+
+<Tab title="String to integer">
+
+```cpp
+// Basic integer conversion — throws on error by default
+int n = NStr::StringToInt("42");
+
+// With radix base
+int hex = NStr::StringToInt("FF", 0, 16);
+
+// Non-throwing variant: returns 0 and sets errno
+int safe = NStr::StringToInt("abc", NStr::fConvErr_NoThrow);
+if (!safe && errno != 0) {
+    // handle error
+}
+
+// Template version works with any numeric type
+Uint8 big = NStr::StringToNumeric<Uint8>("123456789012345");
+```
+
+</Tab>
+
+<Tab title="Integer to string">
+
+```cpp
+// int / unsigned int
+string s1 = NStr::IntToString(42);
+string s2 = NStr::IntToString(255, 0, 16); // "ff"
+
+// Int8 / Uint8
+string s3 = NStr::Int8ToString(Int8(9876543210LL));
+string s4 = NStr::UInt8ToString(Uint8(18000000000ULL));
+
+// With formatting flags
+string s5 = NStr::IntToString(1000000, NStr::fWithCommas);
+// s5 == "1,000,000"
+
+// Template version
+string s6 = NStr::NumericToString(3.14159, NStr::fDoubleFixed);
+```
+
+</Tab>
+
+<Tab title="String to double">
+
+```cpp
+double d = NStr::StringToDouble("3.14");
+double d2 = NStr::StringToDouble("1.5e10");
+
+// Posix locale (dot as decimal separator, always)
+double d3 = NStr::StringToDouble("3,14",
+                NStr::fDecimalPosixOrLocal); // tries both
+```
+
+</Tab>
+
+</Tabs>
+
+### Splitting and Joining
+
+```cpp
+// Split into vector<string> by delimiter characters
+vector<string> parts;
+NStr::Split("a:b:c:d", ":", parts);
+// parts == {"a", "b", "c", "d"}
+
+// Multiple delimiters treated as a character set
+NStr::Split("a,b;c:d", ",;:", parts);
+
+// Ignore empty tokens between consecutive delimiters
+NStr::Split("a,,b", ",", parts, NStr::fSplit_MergeDelimiters);
+// parts == {"a", "b"}
+
+// Split by exact pattern (not character set)
+NStr::SplitByPattern("a::b::c", "::", parts);
+// parts == {"a", "b", "c"}
+
+// Join with delimiter
+vector<string> words = {"one", "two", "three"};
+string joined = NStr::Join(words, ", ");
+// joined == "one, two, three"
+
+// Join any container or iterator range
+list<string> lst = {"x", "y"};
+string result = NStr::Join(lst, "-");
+```
+
+### Searching
+
+```cpp
+// Case-insensitive find — returns position or NPOS
+SIZE_TYPE pos = NStr::FindNoCase("Hello World", "world");
+// pos == 6
+
+// With start position
+SIZE_TYPE pos2 = NStr::FindNoCase("abcABC", "abc", 3);
+// pos2 == 3 (the uppercase ABC)
+
+// Find in container
+vector<string> names = {"Alice", "Bob", "Charlie"};
+const string* found = NStr::FindNoCase(names, "bob");
+// found points to "Bob" in the vector
+```
+
+### String Comparison
+
+```cpp
+// Case-sensitive: returns 0, negative, or positive
+int r1 = NStr::CompareCase("Apple", "apple");   // positive
+int r2 = NStr::CompareNocase("Apple", "apple"); // 0
+
+// Equality predicates (return bool)
+bool eq1 = NStr::EqualCase("abc", "abc");     // true
+bool eq2 = NStr::EqualNocase("Abc", "ABC");   // true
+
+// Combined: pick case-sensitivity at runtime
+bool eq3 = NStr::Equal("abc", "ABC", NStr::eNocase); // true
+```
+
+## CTempString: A Zero-Copy String View
+
+`CTempString` (from `<corelib/tempstr.hpp>`, included via `ncbistr.hpp`) is a lightweight, non-owning view of a character sequence. It stores a pointer and a length — no allocation, no copy.
+
+```cpp
+#include <corelib/ncbistr.hpp>
+USING_NCBI_SCOPE;
+
+// Constructing from string literals (no copy)
+CTempString ts1("hello");
+
+// Constructing from std::string (borrows the buffer)
+string s = "world";
+CTempString ts2(s);
+
+// Substring view (also zero-copy)
+CTempString ts3(s, 1, 3); // "orl"
+
+// Use like a string in NStr calls
+SIZE_TYPE pos = NStr::FindNoCase(ts2, "RL"); // 2
+```
+
+### CTempString vs std::string
+
+<Tabs>
+
+<Tab title="When to prefer CTempString">
+
+Use `CTempString` when:
+- Passing string data to functions that only read it
+- Creating substring slices of existing strings
+- Building search/parse loops that would otherwise allocate many short-lived strings
+
+```cpp
+// Efficient: no heap allocation for the view or substring
+void ProcessField(CTempString line, SIZE_TYPE start, SIZE_TYPE len)
+{
+    CTempString field(line, start, len);
+    if (NStr::EqualNocase(field, "null")) {
+        // handle null
+    }
+}
+```
+
+</Tab>
+
+<Tab title="When to use std::string">
+
+Use `std::string` when:
+- You need to own or store the string beyond the source's lifetime
+- You need to modify the string
+- You are returning a string from a function
+
+```cpp
+// Wrong: CTempString may dangle after source string is destroyed
+CTempString Danger()
+{
+    string s = "ephemeral";
+    return CTempString(s); // UNSAFE: s is destroyed on return
+}
+
+// Correct: return std::string
+string Safe()
+{
+    return "ephemeral"; // safe ownership transfer
+}
+```
+
+</Tab>
+
+</Tabs>
+
+<Warning>
+A `CTempString` does **not** own its data. If the underlying `std::string` or `char*` buffer is destroyed or reallocated, the `CTempString` becomes invalid. Never store a `CTempString` whose source may go out of scope.
+</Warning>
+
+## NCBI Portable Integer Types
+
+Defined in `<corelib/ncbitype.h>` and automatically available in all NCBI headers, these types have guaranteed sizes on every platform:
+
+| Type | Size | Signed | Equivalent |
+|------|------|--------|------------|
+| `Int1` | 1 byte | yes | `int8_t` |
+| `Uint1` | 1 byte | no | `uint8_t` |
+| `Int2` | 2 bytes | yes | `int16_t` |
+| `Uint2` | 2 bytes | no | `uint16_t` |
+| `Int4` | 4 bytes | yes | `int32_t` |
+| `Uint4` | 4 bytes | no | `uint32_t` |
+| `Int8` | 8 bytes | yes | `int64_t` |
+| `Uint8` | 8 bytes | no | `uint64_t` |
+
+Use these in preference to `long` or `long long`, which have platform-dependent sizes.
+
+### Sequence Position Types
+
+For bioinformatics applications that deal with biological coordinates:
+
+```cpp
+// TSeqPos: unsigned position on a sequence (Uint4 or larger)
+TSeqPos start = 100;
+TSeqPos end   = 500;
+TSeqPos len   = end - start; // safe: unsigned arithmetic
+
+// TSignedSeqPos: signed position (for differences and offsets)
+TSignedSeqPos offset = TSignedSeqPos(end) - TSignedSeqPos(start);
+// offset == 400 (signed)
+
+TSignedSeqPos backward = TSignedSeqPos(start) - TSignedSeqPos(end);
+// backward == -400 (correctly negative)
+```
+
+<Note>
+`TSeqPos` is the correct type for sequence coordinates in all NCBI data structures. Using plain `int` for positions can cause overflow on sequences longer than 2 GB.
+</Note>
+
+### Numeric Constant Macros
+
+When you need compile-time constants of a specific portable type, use the standard C99 macros exposed by `ncbitype.h`:
+
+```cpp
+// NCBI-specific constant macro helpers
+Int8  max_len   = INT64_C(9000000000);
+Uint8 file_size = UINT64_C(4294967296); // 4 GiB
+```
+
+## Practical Examples
+
+### Parsing a TSV record
+
+```cpp
+void ParseTsvLine(const CTempString& line,
+                  vector<CTempString>& fields)
+{
+    NStr::Split(line, "\t", fields);
+}
+
+// Reading a coordinate field
+CTempString posStr = fields[2];
+TSeqPos pos = static_cast<TSeqPos>(NStr::StringToInt(posStr));
+```
+
+### Building a formatted message
+
+```cpp
+string BuildReport(const string& gene, TSeqPos start, TSeqPos end)
+{
+    return gene + ": " +
+           NStr::IntToString(start) + ".." +
+           NStr::IntToString(end);
+}
+```
+
+<CardGroup cols={2}>
+  <Card title="Application Framework" icon="rocket" href="/core/application-framework">
+    See how argument parsing uses CArgDescriptions and CArgs to read string values.
+  </Card>
+  <Card title="Diagnostics and Logging" icon="circle-exclamation" href="/core/diagnostics-and-logging">
+    Use ERR_POST with string formatting to log diagnostic messages.
+  </Card>
+</CardGroup>

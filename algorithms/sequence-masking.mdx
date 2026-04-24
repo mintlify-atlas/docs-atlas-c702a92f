@@ -1,0 +1,354 @@
+---
+title: "Sequence Masking: DUST, SEG, and WindowMasker"
+description: "Filter low-complexity DNA and protein regions using CSymDustMasker, CSegMasker, and CSeqMasker (WindowMasker) and pass masked intervals to BLAST."
+---
+
+Sequence masking identifies and excludes low-complexity regions — repetitive runs, simple repeats, and compositionally biased segments — before similarity searches or alignment. Without masking, these regions produce high-scoring but biologically meaningless hits that obscure true homologs and inflate search time. The NCBI C++ Toolkit provides three independent masker implementations: DUST for nucleotide sequences, SEG for protein sequences, and WindowMasker for genome-scale nucleotide masking using precomputed word frequency statistics.
+
+## Masking concepts
+
+All three algorithms share the same output contract: a list of half-open `[start, stop]` coordinate pairs that mark intervals to exclude. The type alias differs slightly between classes but the semantics are identical:
+
+| Class | Result type alias | Element type |
+|---|---|---|
+| `CSymDustMasker` | `TMaskList` = `vector<pair<size_type, size_type>>` | `(start, stop)` inclusive |
+| `CSegMasker` | `TMaskList` = `vector<pair<TSeqPos, TSeqPos>>` | `(start, stop)` inclusive |
+| `CSeqMasker` | `TMaskList` = `vector<pair<TSeqPos, TSeqPos>>` | `(start, stop)` inclusive |
+
+The masker objects are function objects: call `operator()` with the sequence data to get back a heap-allocated `TMaskList *` (DUST / SEG) or a `unique_ptr<TMaskList>` (DUST v2). The caller owns the result.
+
+## Masking workflow
+
+<Steps>
+  <Step title="Choose the appropriate masker">
+    Use `CSymDustMasker` for nucleotide sequences in local BLAST searches. Use `CSegMasker` for protein sequences (blastp/blastx). Use `CSeqMasker` when you need organism-specific genome masking driven by precomputed word-frequency statistics.
+  </Step>
+  <Step title="Prepare the sequence vector">
+    All maskers accept a `CSeqVector` (from the NCBI Object Manager) as their primary input. Retrieve it via `CBioseq_Handle::GetSeqVector(CBioseq_Handle::eCoding_Iupac)` for nucleotides or `eCoding_Ncbistdaa` for proteins.
+  </Step>
+  <Step title="Run the masker">
+    Instantiate the masker with any parameter overrides and call `operator()` on the `CSeqVector`. Retrieve the `TMaskList`.
+  </Step>
+  <Step title="Apply masks to query or subject">
+    Convert the interval list to a `CSeq_loc` of packed intervals and attach it to the `SSeqLoc::mask` field (for `CLocalBlast`) or set it directly in `CBlastNucleotideOptionsHandle::SetMaskAtHash`.
+  </Step>
+  <Step title="Write masked output (optional)">
+    Use `CMaskWriter` subclasses to serialise masked intervals to FASTA (lowercase softmask), interval lists, or ASN.1 format.
+  </Step>
+</Steps>
+
+## DUST algorithm: CSymDustMasker
+
+`CSymDustMasker` implements the symmetric DUST algorithm, which identifies low-complexity nucleotide regions by scoring overlapping windows of trinucleotide frequencies. The class is declared in `include/algo/dustmask/symdust.hpp`.
+
+### Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `level` | 20 | Score threshold — windows scoring above this are masked |
+| `window` | 64 | Maximum window size in bases |
+| `linker` | 1 | Maximum gap (bases) at which adjacent masked intervals are merged |
+
+### Basic usage
+
+```cpp
+#include <algo/dustmask/symdust.hpp>
+#include <objmgr/object_manager.hpp>
+#include <objmgr/scope.hpp>
+#include <objmgr/bioseq_handle.hpp>
+
+USING_NCBI_SCOPE;
+USING_SCOPE(objects);
+
+void DustMaskSequence(CBioseq_Handle bsh)
+{
+    // Default parameters: level=20, window=64, linker=1
+    CSymDustMasker duster;
+
+    // Retrieve the sequence in IUPAC-NA encoding
+    CSeqVector sv = bsh.GetSeqVector(CBioseq_Handle::eCoding_Iupac);
+
+    // Run masker — returns unique_ptr<TMaskList>
+    auto mask_list = duster(sv);
+
+    for (const auto& interval : *mask_list) {
+        NcbiCout << "[" << interval.first
+                 << ", " << interval.second << "]\n";
+    }
+}
+```
+
+### Custom parameters
+
+```cpp
+// Stricter masking: lower threshold, larger window, merge nearby intervals
+CSymDustMasker strict_duster(
+    /*level=*/  18,
+    /*window=*/ 32,
+    /*linker=*/ 4);
+
+auto masks = strict_duster(sv);
+```
+
+### Returning CSeq_loc objects
+
+`CSymDustMasker` can return results as a `CPacked_seqint` or as individual `CSeq_loc` objects, which is more convenient for direct use with the BLAST API:
+
+```cpp
+CRef<CPacked_seqint> packed = duster.GetMaskedInts(seq_id, sv);
+
+// Or as a vector of CSeq_loc const refs
+vector<CConstRef<CSeq_loc>> locs;
+duster.GetMaskedLocs(seq_id, sv, locs);
+```
+
+## SEG algorithm: CSegMasker
+
+`CSegMasker` wraps the SEG algorithm for identifying low-complexity regions in protein sequences. It is declared in `include/algo/segmask/segmask.hpp`. SEG uses a sliding window and computes the local compositional complexity; windows below a cutoff score are masked.
+
+### Parameters
+
+The default values match the BLAST command-line SEG defaults:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `window` | `kSegWindow` (12) | Window size in residues |
+| `locut` | `kSegLocut` (2.2) | Lower complexity cutoff — windows below this are always masked |
+| `hicut` | `kSegHicut` (2.5) | Upper complexity cutoff — masked regions extend to this boundary |
+
+### Usage
+
+```cpp
+#include <algo/segmask/segmask.hpp>
+#include <objmgr/seq_vector.hpp>
+
+USING_NCBI_SCOPE;
+USING_SCOPE(objects);
+
+void SegMaskProtein(CBioseq_Handle bsh)
+{
+    // Default SEG parameters
+    CSegMasker seg;
+
+    // Protein sequence in NCBISTDAA encoding
+    CSeqVector sv = bsh.GetSeqVector(
+        CBioseq_Handle::eCoding_Ncbistdaa);
+
+    CSegMasker::TMaskList* masks = seg(sv);
+
+    for (const auto& interval : *masks) {
+        NcbiCout << "SEG mask: ["
+                 << interval.first << ", "
+                 << interval.second << "]\n";
+    }
+
+    delete masks;  // caller owns the raw pointer
+}
+```
+
+```cpp
+// Custom SEG parameters
+CSegMasker custom_seg(
+    /*window=*/ 15,
+    /*locut=*/  1.8,
+    /*hicut=*/  2.1);
+```
+
+<Note>
+`CSegMasker::operator()` returns a raw `TMaskList*`. You are responsible for deleting it. Consider wrapping in a `unique_ptr<CSegMasker::TMaskList>` immediately after the call.
+</Note>
+
+## WindowMasker: CSeqMasker
+
+`CSeqMasker` (declared in `include/algo/winmask/seq_masker.hpp`) implements WindowMasker, a genome-scale masker that uses precomputed unit-score statistics to identify over-represented k-mers. It requires a prebuilt statistics file generated by the `windowmasker` application.
+
+The constructor takes many parameters that mirror the `windowmasker` command-line flags. In practice, most callers use the statistics file and leave other parameters at their defaults.
+
+### Generating statistics (offline step)
+
+```bash
+# Generate unit counts from a genome FASTA
+windowmasker -mk_counts -in genome.fa -out genome.counts
+
+# Convert counts to optimised binary format for fast loading
+windowmasker -convert -in genome.counts -out genome.winstats \
+    -sformat obinary
+```
+
+### Usage in C++
+
+```cpp
+#include <algo/winmask/seq_masker.hpp>
+#include <objmgr/seq_vector.hpp>
+
+USING_NCBI_SCOPE;
+USING_SCOPE(objects);
+
+void WindowMaskerExample(CBioseq_Handle bsh)
+{
+    // Construct masker from precomputed statistics file
+    CSeqMasker masker(
+        "genome.winstats",  // lstat_name
+        /*window_size=*/    64,
+        /*window_step=*/    1,
+        /*unit_step=*/      1,
+        /*textend=*/        30,
+        /*cutoff_score=*/   50,
+        /*max_score=*/      254,
+        /*min_score=*/      0,
+        /*set_max_score=*/  254,
+        /*set_min_score=*/  0,
+        /*merge_pass=*/     false,
+        /*merge_cutoff=*/   50,
+        /*abs_merge_dist=*/ 8,
+        /*mean_merge_dist=*/24,
+        /*merge_unit_step=*/1,
+        /*trigger=*/        "mean",
+        /*tmin_count=*/     0,
+        /*discontig=*/      false,
+        /*pattern=*/        0,
+        /*use_ba=*/         true);
+
+    CSeqVector sv = bsh.GetSeqVector(CBioseq_Handle::eCoding_Iupac);
+
+    // operator() returns raw TMaskList*
+    CSeqMasker::TMaskList* masks = masker(sv);
+
+    for (const auto& interval : *masks) {
+        NcbiCout << "[" << interval.first
+                 << ", " << interval.second << "]\n";
+    }
+
+    delete masks;
+}
+```
+
+### Merging DUST and WindowMasker results
+
+`CSeqMasker::MergeMaskInfo` combines two `TMaskList` objects in place, which is the standard way to apply both DUST and WindowMasker simultaneously (as BLAST does internally when both are enabled):
+
+```cpp
+CSeqMasker::TMaskList* wm_masks  = masker(sv);
+auto                   dust_list = duster(sv);
+
+// Merge dust results into the windowmasker results
+CSeqMasker::TMaskList dust_copy(dust_list->begin(), dust_list->end());
+CSeqMasker::MergeMaskInfo(wm_masks, &dust_copy);
+```
+
+## Converting TMaskList to CSeq_loc
+
+Before passing masked intervals to the BLAST API, convert the interval list to a `CSeq_loc` of type `packed-int`:
+
+```cpp
+#include <objects/seqloc/Seq_loc.hpp>
+#include <objects/seqloc/Packed_seqint.hpp>
+#include <objects/seqloc/Seq_interval.hpp>
+
+CRef<CSeq_loc> MaskListToSeqLoc(
+    const CSeq_id& seq_id,
+    const CSeqMasker::TMaskList& masks)
+{
+    CRef<CSeq_loc> result(new CSeq_loc);
+
+    if (masks.empty()) {
+        result->SetNull();
+        return result;
+    }
+
+    CPacked_seqint& packed = result->SetPacked_int();
+    for (const auto& interval : masks) {
+        CRef<CSeq_interval> si(new CSeq_interval);
+        si->SetId().Assign(seq_id);
+        si->SetFrom(interval.first);
+        si->SetTo(interval.second);
+        si->SetStrand(eNa_strand_both);
+        packed.Set().push_back(si);
+    }
+    return result;
+}
+```
+
+## Integration with BLAST
+
+### Masking the query at hash time
+
+`CBlastNucleotideOptionsHandle` exposes DUST and WindowMasker parameters so the BLAST engine applies them internally to the query before lookup-table construction:
+
+```cpp
+#include <algo/blast/api/blast_nucl_options.hpp>
+
+CRef<CBlastNucleotideOptionsHandle> opts(
+    new CBlastNucleotideOptionsHandle);
+
+// Built-in DUST filtering (default: on for blastn/megablast)
+opts->SetDustFiltering(true);
+opts->SetDustFilteringLevel(20);
+opts->SetDustFilteringWindow(64);
+opts->SetDustFilteringLinker(1);
+
+// WindowMasker via taxid (requires server-side database)
+opts->SetWindowMaskerTaxId(9606);   // Homo sapiens
+
+// WindowMasker via local statistics file path
+opts->SetWindowMaskerDatabase("/data/windowmasker/human.winstats");
+
+// Mask only during lookup table construction, not extension
+opts->SetMaskAtHash(true);
+```
+
+### Passing pre-computed masks via SSeqLoc
+
+For complete control — for example, when running a custom masker or combining multiple mask sources — attach a `CSeq_loc` directly to the `SSeqLoc::mask` field:
+
+```cpp
+#include <algo/blast/api/sseqloc.hpp>
+
+// query_seqloc: the sequence location
+// scope:        object manager scope
+// mask_loc:     CSeq_loc from MaskListToSeqLoc() above
+SSeqLoc masked_query(query_seqloc, scope, mask_loc,
+                     /*ignore_strand_in_mask=*/ true);
+
+TSeqLocVector queries;
+queries.push_back(masked_query);
+
+CRef<IQueryFactory> qf(new CObjMgr_QueryFactory(queries));
+// Use qf normally with CLocalBlast
+```
+
+## Output formats and CMaskWriter
+
+The standalone `windowmasker` and `dustmasker` applications use `CMaskWriter` subclasses to serialise masked intervals. The available concrete writers are declared in `include/algo/winmask/`:
+
+| Class | Format |
+|---|---|
+| `CSeqMaskerOstatAscii` | Human-readable ASCII interval list |
+| `CSeqMaskerOstatBin` | Compact binary format |
+| `CSeqMaskerOstatOptAscii` | Optimised ASCII (unit-score statistics) |
+| `CSeqMaskerOstatOptBin` | Optimised binary (unit-score statistics) |
+
+Use `CSeqMaskerOstatFactory::create` to instantiate the appropriate writer by format name string, avoiding compile-time dependencies on specific subclasses.
+
+## Algorithm comparison
+
+| Algorithm | Class | Molecule | Basis | When to use |
+|---|---|---|---|---|
+| DUST | `CSymDustMasker` | DNA | Trinucleotide frequency | Low-complexity DNA in BLAST query/subject |
+| SEG | `CSegMasker` | Protein | Compositional complexity | Low-complexity protein in blastp/blastx |
+| WindowMasker | `CSeqMasker` | DNA | Genome k-mer frequencies | Genome-scale repeat masking with organism statistics |
+
+<Tip>
+For BLAST searches against RefSeq genomes, NCBI provides prebuilt WindowMasker statistics files for hundreds of organisms via the BLAST FTP site. Use `SetWindowMaskerTaxId` in `CBlastNucleotideOptionsHandle` to activate them automatically when running against BLAST databases that include the corresponding taxid metadata.
+</Tip>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="BLAST Search" href="/algorithms/blast">
+    Use masked query sequences with CLocalBlast and CBlastOptionsHandle
+  </Card>
+  <Card title="Sequence Alignment" href="/algorithms/sequence-alignment">
+    Apply masks before running CNWAligner or CSplign to suppress spurious hits in low-complexity regions
+  </Card>
+</CardGroup>

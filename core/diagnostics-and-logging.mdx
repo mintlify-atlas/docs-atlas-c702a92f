@@ -1,0 +1,336 @@
+---
+title: "NCBI Diagnostics, Logging, and Severity Levels"
+description: "Configure NCBI diagnostic output using ERR_POST macros, severity thresholds, CNcbiDiag stream formatting, and file or stderr redirection strategies."
+---
+
+The NCBI C++ Toolkit ships a unified diagnostics subsystem that handles structured logging, error reporting, and trace output. All output flows through a single configurable `CNcbiDiag` stream, and the `ERR_POST` family of macros provides a convenient interface that automatically captures file, line, and module metadata at the call site.
+
+## Severity Levels
+
+Severity is expressed as the `EDiagSev` enum, defined in `<corelib/ncbidiag.hpp>`. From lowest to highest:
+
+```cpp
+enum EDiagSev {
+    eDiag_Info = 0,   ///< Informational message
+    eDiag_Warning,    ///< Warning message
+    eDiag_Error,      ///< Error message  (default post level)
+    eDiag_Critical,   ///< Critical error message
+    eDiag_Fatal,      ///< Fatal error -- guarantees exit(or abort)
+    eDiag_Trace,      ///< Trace message (most verbose)
+
+    eDiagSevMin = eDiag_Info,
+    eDiagSevMax = eDiag_Trace
+};
+```
+
+<Note>
+`eDiag_Fatal` is special: it always triggers program termination (abort or exit) after flushing the message. `eDiag_Trace` is the most verbose level and is only posted when the threshold is explicitly lowered to trace.
+</Note>
+
+## ERR_POST Macro Family
+
+The macros are defined in `<corelib/ncbidiag.hpp>` and compose a temporary `CNcbiDiag` object, stream your message into it, then flush with `Endm`:
+
+### ERR_POST — basic posting
+
+Posts at the current severity level (default `eDiag_Error`) with file and line information captured automatically:
+
+```cpp
+#include <corelib/ncbidiag.hpp>
+USING_NCBI_SCOPE;
+
+// Post an error message
+ERR_POST("Failed to open file: " << filename);
+
+// Change severity via manipulator
+ERR_POST(Warning << "Cache miss for key: " << key);
+ERR_POST(Info    << "Processing record " << record_id);
+ERR_POST(Critical << "Database connection lost");
+```
+
+The macro expands to construct a `CNcbiDiag` at `DIAG_COMPILE_INFO` (which captures `__FILE__`, `__LINE__`, and the current function), stream the message into it, then send `Endm` to flush.
+
+### ERR_POST_EX — with explicit error codes
+
+When you need to attach a numeric error code and subcode:
+
+```cpp
+ERR_POST_EX(110, 3, "Sequence validation failed: " << seq_id);
+//           ^    ^
+//      err_code  err_subcode
+```
+
+### ERR_POST_X — with named error codes (preferred)
+
+The recommended pattern in library code. Error codes are registered with `NCBI_DEFINE_ERRCODE_X` and referenced by name:
+
+```cpp
+// In a .cpp file, register the error code:
+NCBI_DEFINE_ERRCODE_X(MyLib_Parser, 200, 5);
+
+// Set as default for this source file:
+#define NCBI_USE_ERRCODE_X  MyLib_Parser
+
+// Post with subcode 2 (must be <= max=5)
+ERR_POST_X(2, "Unexpected token at position " << pos);
+```
+
+This approach enables systematic error code tracking and flexible log filtering.
+
+### LOG_POST — plain log messages
+
+`LOG_POST` prints only the message text, omitting severity prefix, file/line context, and error codes. It is useful for structured application log output:
+
+```cpp
+LOG_POST("Processing complete. Records: " << count);
+// Output: Processing complete. Records: 42
+```
+
+### ERR_FATAL — fatal errors
+
+Posts a fatal message and guarantees program termination:
+
+```cpp
+ERR_FATAL("Unrecoverable state: " << description);
+// Program will not continue past this line
+```
+
+### Rate-limiting variants
+
+To suppress repeated identical messages:
+
+```cpp
+// Post at most once during the lifetime of the program
+ERR_POST_ONCE(Warning << "Legacy feature used");
+
+// Post at most N times
+ERR_POST_N_TIMES(5, Error << "Retry failed for: " << url);
+```
+
+## Controlling the Post Threshold with SetDiagPostLevel
+
+`SetDiagPostLevel()` sets the minimum severity a message must have to be printed. Messages below the threshold are silently discarded:
+
+```cpp
+// Default: only Error and above are printed
+SetDiagPostLevel(eDiag_Error);
+
+// During development: also show warnings and info
+SetDiagPostLevel(eDiag_Info);
+
+// Maximum verbosity: show everything including trace
+SetDiagPostLevel(eDiag_Trace);
+
+// Query current level
+EDiagSev current = GetDiagPostLevel();
+```
+
+<Tip>
+You can also set the post level via the environment variable `DIAG_POST_LEVEL` or via `[DEBUG] DIAG_POST_LEVEL` in the application's `.ini` file. This lets operators adjust logging without recompilation.
+</Tip>
+
+The threshold can be locked to prevent inadvertent changes from library code:
+
+```cpp
+// Lock at Warning — subsequent SetDiagPostLevel() calls have no effect
+SetDiagFixedPostLevel(eDiag_Warning);
+```
+
+## CNcbiDiag: Stream-Based Logging
+
+`CNcbiDiag` is the underlying class that all macros use. You can use it directly for fine-grained control:
+
+```cpp
+#include <corelib/ncbidiag.hpp>
+USING_NCBI_SCOPE;
+
+// Construct with explicit severity and format flags
+CNcbiDiag diag(DIAG_COMPILE_INFO, eDiag_Warning, eDPF_Default);
+diag << "Custom warning: " << code << Endm;
+
+// Alternatively, use the severity manipulators:
+CNcbiDiag(DIAG_COMPILE_INFO) << Info << "Starting phase " << phase << Endm;
+```
+
+Severity manipulators available as stream operators:
+
+```cpp
+Info     // eDiag_Info
+Warning  // eDiag_Warning
+Error    // eDiag_Error
+Critical // eDiag_Critical
+Fatal    // eDiag_Fatal (triggers abort)
+Trace    // eDiag_Trace
+```
+
+### Diagnostic post flags
+
+`EDiagPostFlag` bits control what metadata appears on each posted line. Selected flags:
+
+```cpp
+eDPF_File           // filename (short form)
+eDPF_LongFilename   // full file path
+eDPF_Line           // source line number
+eDPF_Severity       // severity label (e.g., "Error: ")
+eDPF_ErrorID        // error code and subcode
+eDPF_DateTime       // date and time stamp
+eDPF_TID            // thread ID
+eDPF_Location       // class::function context
+eDPF_Default        // use current global flags
+```
+
+Set or clear flags globally:
+
+```cpp
+// Add timestamp to all subsequent messages
+SetDiagPostFlag(eDPF_DateTime);
+
+// Remove file/line from output
+UnsetDiagPostFlag(eDPF_File);
+UnsetDiagPostFlag(eDPF_Line);
+
+// Replace all global flags at once
+SetDiagPostAllFlags(eDPF_Severity | eDPF_DateTime | eDPF_ErrorID);
+```
+
+### Prefixes
+
+Prefix strings are prepended to every message, useful for labeling output from different subsystems:
+
+```cpp
+// Push a prefix (stacked — multiple pushes are cumulative)
+PushDiagPostPrefix("MyModule");
+ERR_POST(Info << "Initialized");
+// Output: Info: MyModule: Initialized
+
+PopDiagPostPrefix();
+
+// RAII-style automatic prefix management
+{
+    CDiagAutoPrefix prefix("Request-42");
+    ERR_POST(Info << "Processing");
+    // Output: Info: Request-42: Processing
+} // prefix removed here
+```
+
+## Redirecting Diagnostic Output
+
+<Tabs>
+
+<Tab title="To a file">
+
+Redirect all diagnostic output to a log file by passing `-logfile` on the command line or by calling `SetDiagStream()`:
+
+```cpp
+#include <corelib/ncbidiag.hpp>
+
+// Redirect to a file (CNcbiApplication does this automatically
+// when -logfile is passed)
+unique_ptr<CNcbiOfstream> log_file(
+    new CNcbiOfstream("myapp.log"));
+SetDiagStream(log_file.get());
+```
+
+Users can also pass `-logfile myapp.log` to any `CNcbiApplication`-based program without any code changes.
+
+</Tab>
+
+<Tab title="To stderr">
+
+The default destination is `stderr`. To explicitly restore it:
+
+```cpp
+// Restore stderr output
+SetDiagStream(&NcbiCerr);
+```
+
+</Tab>
+
+<Tab title="To memory buffer">
+
+Temporarily capture diagnostics in memory (useful in CGI or server contexts where you want to replay them later):
+
+```cpp
+// Captured by AppMain when eDS_ToMemory is passed
+// Flush captured output to an ostream:
+GetDiagContext().FlushMessages(NcbiCerr);
+```
+
+</Tab>
+
+</Tabs>
+
+## Severity-Checking Convenience Macros
+
+For performance-sensitive code paths, check whether a severity will be posted before constructing the message:
+
+```cpp
+// Only build the message string if Info would be printed
+INFO_POST("Record processed: " << record.GetId());
+
+// Equivalent to:
+if (IsVisibleDiagPostLevel(eDiag_Info)) {
+    ERR_POST(Info << "Record processed: " << record.GetId());
+}
+
+// Warning and Trace variants
+WARNING_POST("Retry " << attempt << " of " << max_attempts);
+TRACE_POST("Internal counter: " << m_Count);
+```
+
+## Complete Example
+
+```cpp
+#include <corelib/ncbiapp.hpp>
+#include <corelib/ncbidiag.hpp>
+USING_NCBI_SCOPE;
+
+// Register error codes for this library component
+NCBI_DEFINE_ERRCODE_X(MyLib_IO, 300, 10);
+#define NCBI_USE_ERRCODE_X MyLib_IO
+
+class CMyApp : public CNcbiApplication
+{
+    void Init() override
+    {
+        // Lower threshold so Info messages appear
+        SetDiagPostLevel(eDiag_Info);
+
+        // Add timestamps to all messages
+        SetDiagPostFlag(eDPF_DateTime);
+    }
+
+    int Run() override
+    {
+        LOG_POST("Application started");
+
+        ERR_POST(Info    << "Loading configuration");
+        ERR_POST(Warning << "Config key 'timeout' missing, using default");
+
+        try {
+            // ... some operation ...
+        }
+        catch (const CException& ex) {
+            ERR_POST_X(1, Error << "Operation failed: " << ex.GetMsg());
+            return 1;
+        }
+
+        LOG_POST("Application finished successfully");
+        return 0;
+    }
+};
+
+int NcbiSys_main(int argc, const char* argv[])
+{
+    return CMyApp().AppMain(argc, argv);
+}
+```
+
+<CardGroup cols={2}>
+  <Card title="Exceptions" icon="triangle-exclamation" href="/core/exceptions">
+    Learn how CException integrates with the diagnostic system for structured error reporting.
+  </Card>
+  <Card title="Application Framework" icon="rocket" href="/core/application-framework">
+    See how CNcbiApplication configures diagnostics automatically during startup.
+  </Card>
+</CardGroup>

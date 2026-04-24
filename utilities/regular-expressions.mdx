@@ -1,0 +1,367 @@
+---
+title: 'Regular Expressions with PCRE in the NCBI C++ Toolkit'
+description: 'Use CRegexp and CRegexpUtil to match, extract, and replace text with Perl-compatible regular expressions in NCBI C++ applications.'
+---
+
+The NCBI C++ Toolkit wraps the Perl Compatible Regular Expression (PCRE) library in the `CRegexp` class, defined in `<util/xregexp/regexp.hpp>`. The wrapper compiles patterns once and reuses them efficiently, supports all standard PCRE compile and match flags, and returns match results as lightweight `CTempString` views over the original data — avoiding copies on every match. The companion `CRegexpUtil` class provides stateful replace and range operations for more complex text processing tasks.
+
+<Note>
+Include `<util/xregexp/regexp.hpp>` in new code. The older path `<util/regexp.hpp>` is a deprecated shim that emits a compiler warning and will be removed in a future release.
+</Note>
+
+---
+
+## CRegexp — compiling and matching patterns
+
+### Constructor and Set()
+
+```cpp
+// CRegexp(CTempStringEx pattern, TCompile flags = fCompile_default)
+CRegexp re("^>\\s*(\\S+)");              // compile once
+CRegexp re_ci("accession", CRegexp::fCompile_ignore_case); // case-insensitive
+```
+
+`Set()` recompiles the same object with a new pattern, which lets you reuse the object while changing the pattern:
+
+```cpp
+re.Set("^>\\s*(\\S+)\\s*(.*)", CRegexp::fCompile_default);
+```
+
+### Compile flags (ECompile)
+
+| Flag | Meaning |
+|------|---------|
+| `fCompile_default` | Standard PCRE behavior |
+| `fCompile_ignore_case` | Case-insensitive matching |
+| `fCompile_dotall` | `.` matches any character including `\n` |
+| `fCompile_newline` | `^`/`$` match at line boundaries, not just string boundaries |
+| `fCompile_ungreedy` | Quantifiers are non-greedy by default |
+| `fCompile_extended` | Allow inline comments and whitespace in the pattern |
+
+### Match flags (EMatch)
+
+| Flag | Meaning |
+|------|---------|
+| `fMatch_default` | Standard PCRE matching |
+| `fMatch_not_begin` | `^` does not match the start of the string |
+| `fMatch_not_end` | `$` does not match the end of the string |
+| `fMatch_not_both` | Both of the above |
+
+---
+
+## Core match methods
+
+<Tabs>
+  <Tab title="IsMatch — test for a match">
+
+`IsMatch()` returns `true` if the pattern appears anywhere in the string. It is the most efficient way to test for the presence of a pattern because it does not build the full result set.
+
+```cpp
+#include <util/xregexp/regexp.hpp>
+
+USING_NCBI_SCOPE;
+
+CRegexp re_accession("^[A-Z]{1,2}[0-9]{5,9}(\\.[0-9]+)?$");
+
+bool IsAccession(const string& s)
+{
+    return re_accession.IsMatch(s);
+}
+
+// Usage:
+_ASSERT( IsAccession("NM_001234.5"));
+_ASSERT(!IsAccession("random text"));
+```
+
+  </Tab>
+  <Tab title="GetMatch — extract a match">
+
+`GetMatch()` performs the search and returns the text matched by the complete pattern (index 0) or by a numbered capture group (index ≥ 1). The returned `CTempString` is a non-owning view into the original string — do not let the source string go out of scope while holding the result.
+
+```cpp
+USING_NCBI_SCOPE;
+
+// Extract the accession number from a FASTA defline
+// Pattern: >(accession)  optional description
+CRegexp re(">([A-Z0-9_.]+)");
+
+string defline = ">NM_001234.5 Homo sapiens mRNA";
+CTempString accession = re.GetMatch(defline, 0, 1); // group 1
+LOG_POST("Accession: " << accession); // "NM_001234.5"
+
+// Retrieve the full match (group 0)
+CTempString full = re.GetMatch(defline, 0, 0);
+LOG_POST("Full match: " << full);     // ">NM_001234.5"
+```
+
+`GetMatch()` signature:
+
+```cpp
+CTempString GetMatch(
+    CTempString str,
+    size_t      offset   = 0,   // starting position in str
+    size_t      idx      = 0,   // 0 = full match, >0 = capture group
+    TMatch      flags    = fMatch_default,
+    bool        noreturn = false // if true, returns empty string (use GetSub/GetResults instead)
+);
+```
+
+  </Tab>
+  <Tab title="GetResults — numeric offsets">
+
+`GetResults()` returns a pair of offsets `[start, end)` into the source string for the pattern or a capture group. Use these when you need the byte position of a match rather than the matched text, or when you want to extract multiple groups after a single `GetMatch()` call.
+
+```cpp
+USING_NCBI_SCOPE;
+
+// Parse FASTA header: >accession description
+CRegexp re(">([^\\s]+)\\s+(.+)");
+string header = ">NM_001234.5 Homo sapiens mRNA";
+
+// Run the match (pass noreturn=true to skip string building)
+re.GetMatch(header, 0, 0, CRegexp::fMatch_default, true);
+
+int n = re.NumFound(); // number of groups found (including group 0)
+if (n >= 3) {
+    // GetResults returns pointer to [start, end] for group idx
+    const CRegexp::TOffset* g1 = re.GetResults(1);
+    const CRegexp::TOffset* g2 = re.GetResults(2);
+
+    string acc  = header.substr(g1[0], g1[1] - g1[0]); // "NM_001234.5"
+    string desc = header.substr(g2[0], g2[1] - g2[0]); // "Homo sapiens mRNA"
+    LOG_POST(acc << " — " << desc);
+}
+```
+
+  </Tab>
+</Tabs>
+
+### GetSub() and NumFound()
+
+After a `GetMatch()` call, you can retrieve additional groups without repeating the search:
+
+```cpp
+CRegexp re("(\\d{4})-(\\d{2})-(\\d{2})");
+string date = "Published 2024-03-15 in journal";
+
+re.GetMatch(date, 0, 0, CRegexp::fMatch_default, true);
+
+if (re.NumFound() >= 4) { // group 0 + groups 1, 2, 3
+    CTempString year  = re.GetSub(date, 1); // "2024"
+    CTempString month = re.GetSub(date, 2); // "03"
+    CTempString day   = re.GetSub(date, 3); // "15"
+    LOG_POST(year << "/" << month << "/" << day);
+}
+```
+
+---
+
+## Practical examples
+
+### Extracting FASTA headers
+
+```cpp
+#include <util/xregexp/regexp.hpp>
+
+USING_NCBI_SCOPE;
+
+struct SFastaHeader {
+    string accession;
+    string description;
+};
+
+// Matches: >(acc[.version]) [description]
+CRegexp g_FastaRe(">([A-Za-z0-9_.]+)(?:\\s+(.*))?",
+                  CRegexp::fCompile_default);
+
+SFastaHeader ParseFastaHeader(const string& line)
+{
+    SFastaHeader result;
+    if (g_FastaRe.NumFound() >= 0) {
+        // Reset by calling GetMatch
+    }
+    g_FastaRe.GetMatch(line, 0, 0, CRegexp::fMatch_default, true);
+
+    if (g_FastaRe.NumFound() >= 2) {
+        result.accession = string(g_FastaRe.GetSub(line, 1));
+    }
+    if (g_FastaRe.NumFound() >= 3) {
+        result.description = string(g_FastaRe.GetSub(line, 2));
+    }
+    return result;
+}
+```
+
+### Parsing accession numbers
+
+```cpp
+USING_NCBI_SCOPE;
+
+// RefSeq accession: two letters + digits + optional dot-version
+CRegexp g_RefSeqRe("[A-Z]{2}_[0-9]+(?:\\.[0-9]+)?",
+                   CRegexp::fCompile_default);
+
+// GenBank accession: one or two letters + 5-8 digits
+CRegexp g_GenbankRe("[A-Z]{1,2}[0-9]{5,8}",
+                    CRegexp::fCompile_default);
+
+void ExtractAccessions(const string& text, vector<string>& out)
+{
+    size_t offset = 0;
+    CTempString match;
+    while (!(match = g_RefSeqRe.GetMatch(text, offset)).empty()) {
+        out.push_back(string(match));
+        const CRegexp::TOffset* r = g_RefSeqRe.GetResults(0);
+        offset = r[1]; // advance past this match
+    }
+}
+```
+
+---
+
+## CRegexpUtil — stateful text processing
+
+`CRegexpUtil` wraps a mutable string and provides `Exists()`, `Extract()`, and `Replace()` methods without requiring you to create and manage `CRegexp` objects manually.
+
+```cpp
+#include <util/xregexp/regexp.hpp>
+
+USING_NCBI_SCOPE;
+
+// Replace all lowercase letters with underscores
+CRegexpUtil util("Hello World 123");
+size_t count = util.Replace("[a-z]", "_");
+string result = util.GetResult(); // "H____ W____ 123"
+LOG_POST("Replaced " << count << " characters");
+```
+
+### CRegexpUtil API summary
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| Constructor | `CRegexpUtil(CTempString str = kEmptyStr)` | Creates a utility object wrapping the given string. |
+| `Reset()` | `void Reset(CTempString str)` | Replaces the content string. |
+| `GetResult()` | `string GetResult(void)` | Returns the (possibly modified) string. |
+| `Exists()` | `bool Exists(CTempStringEx pattern, TCompile, TMatch)` | Returns `true` if the pattern matches anywhere in the string. |
+| `Extract()` | `string Extract(CTempStringEx pattern, TCompile, TMatch, size_t idx)` | Returns the text of a pattern or capture group match. |
+| `Replace()` | `size_t Replace(CTempStringEx search, CTempString replace, TCompile, TMatch, size_t max_replace)` | Replaces occurrences of `search` with `replace`. In `replace`, use `$1`, `$2`, … to insert capture groups. Returns count of replacements. |
+| `SetRange()` | `void SetRange(CTempStringEx start, CTempStringEx end, CTempString delimiter)` | Restricts range-based operations to lines between `start` and `end` addresses. |
+| `ReplaceRange()` | `size_t ReplaceRange(...)` | Like `Replace()`, but only within (or outside) the range set by `SetRange()`. |
+
+### Replace with back-references
+
+Back-references in the replacement string use `$1`, `$2`, … (or `${1}`, `${2}`, … with curly braces):
+
+```cpp
+// Reformat "Last, First" to "First Last"
+CRegexpUtil util("Smith, John");
+util.Replace("(\\w+),\\s*(\\w+)", "$2 $1");
+string result = util.GetResult(); // "John Smith"
+```
+
+### Range-based replacement
+
+`SetRange()` splits the content by a delimiter and applies `ReplaceRange()` only to lines between a start and end address pattern (similar to SED's address ranges):
+
+```cpp
+// Replace content only between BEGIN and END markers
+CRegexpUtil util("header\nBEGIN\nsome text\nEND\nfooter");
+util.SetRange("BEGIN", "END", "\n");
+util.ReplaceRange("text", "DATA");
+string result = util.GetResult(); // replaces "text" -> "DATA" only inside the range
+```
+
+---
+
+## CRegexpTemplateTester — template-based text validation
+
+`CRegexpTemplateTester` (defined in `<util/xregexp/regexp_template_tester.hpp>`) matches delimited text (such as multi-line output or tabular data) against a template where each rule line is a PCRE pattern. Variables defined in the template can be reused across rules.
+
+```cpp
+#include <util/xregexp/regexp_template_tester.hpp>
+
+USING_NCBI_SCOPE;
+
+// Template syntax (in a file or inline string):
+//   # set ver=\d+\.\d+
+//   Version: ${ver}        <- this line is a regexp rule
+//   Date: \d{4}-\d{2}-\d{2}
+
+CRegexpTemplateTester tester;
+tester.Init("template.tpl");   // load template from file
+bool ok = tester.Test("output.txt", cerr);
+if (!ok) {
+    LOG_POST(Error << "Output does not match template");
+}
+```
+
+Template commands:
+
+| Command | Syntax | Description |
+|---------|--------|-------------|
+| `set` | `# set name=value` | Define a variable. Values may reference other variables as `${name}`. |
+| `echo` | `# echo text ${var}` | Print a string (for debugging). |
+| `test` | `# test ${a}==value` | Assert a variable equals a value. Operators: `==`, `!=`, `=~`, `!~`. |
+| `include` | `# include path/to/sub.tpl` | Include another template file. |
+| `skip` | `# skip N` | Skip the next N lines in the tested data. |
+| `stop` | `# stop` | Stop comparing at this point. |
+
+<Tip>
+Use `CRegexpTemplateTester` in unit tests to validate multi-line output from NCBI tools. The template approach is more maintainable than embedding long expected-output strings in test code because you can add comments and version-specific variable definitions directly in the template file.
+</Tip>
+
+---
+
+## Static utility methods on CRegexp
+
+```cpp
+// Escape all PCRE meta-characters in a string
+string safe = CRegexp::Escape("3.14 (approx.)");
+// Result: "3\\.14 \\(approx\\.\\)"
+
+// Convert a shell wildcard mask to a PCRE pattern
+// '*' -> '.*', '?' -> '.'
+string re_pat = CRegexp::WildcardToRegexp("NM_*.txt");
+// Result: "NM_.*\\.txt"
+```
+
+---
+
+## Handling multiple matches (iterating)
+
+`CRegexp` does not have a built-in iterator, but you can advance through a string by tracking the end offset of the previous match via `GetResults()`:
+
+```cpp
+USING_NCBI_SCOPE;
+
+CRegexp re("[A-Z]{1,2}[0-9]{5,9}");
+string text = "See NM_001234 and AB987654 for details.";
+
+size_t offset = 0;
+while (!re.GetMatch(text, offset).empty()) {
+    const CRegexp::TOffset* r = re.GetResults(0);
+    string acc = text.substr(r[0], r[1] - r[0]);
+    LOG_POST("Found: " << acc << " at [" << r[0] << ", " << r[1] << ")");
+    offset = r[1]; // advance past the current match
+    if (offset >= text.size()) break;
+}
+```
+
+---
+
+## Quick-reference card
+
+<Columns cols={2}>
+  <Card title="Testing presence" icon="search">
+    Use `CRegexp::IsMatch()` or `CRegexpUtil::Exists()` when you only need to know whether a pattern appears. Both are faster than `GetMatch()` because they avoid building result strings.
+  </Card>
+  <Card title="Extracting groups" icon="scissors">
+    Use `GetMatch(str, 0, idx)` for a single group, or call with `noreturn=true` then iterate `GetSub()` / `GetResults()` for multiple groups without re-running the match.
+  </Card>
+  <Card title="Replacing text" icon="edit">
+    Use `CRegexpUtil::Replace()` for simple substitutions. Use `$1`, `$2`, … in the replacement string to insert capture groups. Use `ReplaceRange()` to restrict replacements to a delimited section of the text.
+  </Card>
+  <Card title="Validating structured output" icon="check-square">
+    Use `CRegexpTemplateTester` to validate multi-line program output against a template file in integration and regression tests.
+  </Card>
+</Columns>

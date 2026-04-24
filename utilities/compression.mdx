@@ -1,0 +1,393 @@
+---
+title: 'Data Compression Utilities in the NCBI C++ Toolkit'
+description: 'How to compress and decompress data in memory and via C++ streams using zlib, bzip2, LZO, and Zstandard with the NCBI Compression API.'
+---
+
+The NCBI C++ Toolkit compression API (under `<util/compress/>`) wraps zlib, bzip2, LZO, and Zstandard behind a single abstract interface. You can compress and decompress data in memory, through C++ I/O streams, or directly on files. The toolkit bundles its own copies of zlib, bzip2, and a Cloudflare fork of zlib, so those algorithms are always available on every supported platform. LZO and Zstandard depend on external libraries (`HAVE_LIBLZO`, `HAVE_LIBZSTD`) and require conditional compilation guards.
+
+<Note>
+For most NCBI genomics workflows, zlib gzip (`.gz`) is the safest choice for interoperability. Use Zstandard when maximum throughput matters and you control both ends of the pipeline.
+</Note>
+
+## Library availability macros
+
+```cpp
+// Always available (embedded fallback):
+//   HAVE_LIBZ      — zlib / gzip
+//   HAVE_LIBBZ2    — bzip2
+
+// Require external library:
+//   HAVE_LIBLZO    — LZO
+//   HAVE_LIBZSTD   — Zstandard
+
+#if defined(HAVE_LIBZSTD)
+    // Zstd-specific code
+#endif
+```
+
+---
+
+## ICompression and CCompression — the base interface
+
+`ICompression` (declared in `<util/compress/compress.hpp>`) defines the interface all compression implementations share:
+
+```cpp
+class ICompression
+{
+public:
+    enum ELevel {
+        eLevel_Default       = -1,
+        eLevel_NoCompression =  0,
+        eLevel_Lowest        =  1,
+        eLevel_Low           =  3,
+        eLevel_Medium        =  5,
+        eLevel_High          =  7,
+        eLevel_Best          =  9
+    };
+
+    virtual bool CompressBuffer(
+        const void* src_buf, size_t  src_len,
+        void*       dst_buf, size_t  dst_size,
+        /* out */            size_t* dst_len
+    ) = 0;
+
+    virtual bool DecompressBuffer(
+        const void* src_buf, size_t  src_len,
+        void*       dst_buf, size_t  dst_size,
+        /* out */            size_t* dst_len
+    ) = 0;
+
+    virtual size_t EstimateCompressionBufferSize(size_t src_len) = 0;
+
+    virtual bool CompressFile(
+        const string& src_file, const string& dst_file,
+        size_t file_io_bufsize = kCompressionDefaultBufSize, ...
+    ) = 0;
+    virtual bool DecompressFile(...) = 0;
+};
+```
+
+---
+
+## In-memory compression with CompressBuffer / DecompressBuffer
+
+<Tabs>
+  <Tab title="zlib (deflate)">
+
+```cpp
+#include <util/compress/zlib.hpp>
+
+USING_NCBI_SCOPE;
+
+// Compress a string in memory
+string CompressWithZlib(const string& input)
+{
+    CZipCompression zip(CCompression::eLevel_Default);
+
+    size_t out_size = zip.EstimateCompressionBufferSize(input.size());
+    vector<char> out_buf(out_size);
+    size_t dst_len = 0;
+
+    bool ok = zip.CompressBuffer(
+        input.data(), input.size(),
+        out_buf.data(), out_size,
+        &dst_len
+    );
+    if (!ok) {
+        NCBI_THROW(CCompressionException, eCompression,
+                   zip.GetErrorDescription());
+    }
+    return string(out_buf.data(), dst_len);
+}
+
+// Decompress back to a string
+string DecompressWithZlib(const string& compressed, size_t original_size)
+{
+    CZipCompression zip;
+    vector<char> out_buf(original_size * 2); // provide generous buffer
+    size_t dst_len = 0;
+
+    bool ok = zip.DecompressBuffer(
+        compressed.data(), compressed.size(),
+        out_buf.data(), out_buf.size(),
+        &dst_len
+    );
+    if (!ok) {
+        NCBI_THROW(CCompressionException, eCompression,
+                   zip.GetErrorDescription());
+    }
+    return string(out_buf.data(), dst_len);
+}
+```
+
+  </Tab>
+  <Tab title="bzip2">
+
+```cpp
+#include <util/compress/bzip2.hpp>
+
+USING_NCBI_SCOPE;
+
+string CompressWithBZip2(const string& input)
+{
+    CBZip2Compression bz2(CCompression::eLevel_Default);
+
+    // bzip2 can expand data for tiny inputs; use generous estimate
+    size_t out_size = input.size() + input.size() / 10 + 1024;
+    vector<char> out_buf(out_size);
+    size_t dst_len = 0;
+
+    if (!bz2.CompressBuffer(
+            input.data(), input.size(),
+            out_buf.data(), out_size, &dst_len)) {
+        NCBI_THROW(CCompressionException, eCompression,
+                   bz2.GetErrorDescription());
+    }
+    return string(out_buf.data(), dst_len);
+}
+```
+
+  </Tab>
+  <Tab title="Zstandard">
+
+```cpp
+#include <util/compress/zstd.hpp>
+
+USING_NCBI_SCOPE;
+
+#if defined(HAVE_LIBZSTD)
+string CompressWithZstd(const string& input)
+{
+    CZstdCompression zstd(CCompression::eLevel_Default);
+
+    size_t out_size = zstd.EstimateCompressionBufferSize(input.size());
+    vector<char> out_buf(out_size);
+    size_t dst_len = 0;
+
+    if (!zstd.CompressBuffer(
+            input.data(), input.size(),
+            out_buf.data(), out_size, &dst_len)) {
+        NCBI_THROW(CCompressionException, eCompression,
+                   zstd.GetErrorDescription());
+    }
+    return string(out_buf.data(), dst_len);
+}
+#endif
+```
+
+  </Tab>
+  <Tab title="LZO">
+
+```cpp
+#include <util/compress/lzo.hpp>
+
+USING_NCBI_SCOPE;
+
+#if defined(HAVE_LIBLZO)
+string CompressWithLZO(const string& input)
+{
+    CLZOCompression lzo(CCompression::eLevel_Default);
+
+    size_t out_size = lzo.EstimateCompressionBufferSize(input.size());
+    vector<char> out_buf(out_size);
+    size_t dst_len = 0;
+
+    if (!lzo.CompressBuffer(
+            input.data(), input.size(),
+            out_buf.data(), out_size, &dst_len)) {
+        NCBI_THROW(CCompressionException, eCompression,
+                   lzo.GetErrorDescription());
+    }
+    return string(out_buf.data(), dst_len);
+}
+#endif
+```
+
+  </Tab>
+</Tabs>
+
+---
+
+## Compression streams
+
+The stream API (defined in `<util/compress/stream.hpp>` and `<util/compress/stream_util.hpp>`) wraps a compression algorithm as a C++ I/O stream so that you can compress or decompress data transparently during normal stream I/O.
+
+### CCompressionIStream / CCompressionOStream
+
+These are the fundamental stream wrappers. Each one takes a `CCompressionStreamProcessor` that controls the direction (compress vs. decompress) and the algorithm.
+
+```cpp
+#include <util/compress/stream_util.hpp>
+
+USING_NCBI_SCOPE;
+
+// Write compressed gzip data to a file
+void WriteGzip(const string& path, const string& data)
+{
+    CNcbiOfstream file(path.c_str(), ios::binary);
+
+    // CCompressOStream writes compressed data into 'file'
+    CCompressOStream out(file, CCompressStream::eGZipFile);
+    out.write(data.data(), data.size());
+    out.Finalize(); // flush and write the gzip footer
+}
+
+// Read gzip-compressed data from a file and decompress it
+string ReadGzip(const string& path)
+{
+    CNcbiIfstream file(path.c_str(), ios::binary);
+
+    // CDecompressIStream reads from 'file' and decompresses on the fly
+    CDecompressIStream in(file, CCompressStream::eGZipFile);
+
+    string result;
+    char buf[4096];
+    while (in.read(buf, sizeof(buf)) || in.gcount() > 0) {
+        result.append(buf, (size_t)in.gcount());
+    }
+    return result;
+}
+```
+
+<Warning>
+Always call `Finalize()` on output compression streams before the stream is destroyed. Without it, the final compressed block and the format footer may not be flushed to the underlying stream, producing a truncated or invalid file.
+</Warning>
+
+### Available stream method values (CCompressStream::EMethod)
+
+| Enum value | Algorithm | Notes |
+|------------|-----------|-------|
+| `eNone` | Copy as-is | No compression; useful as a transparent adapter |
+| `eBZip2` | bzip2 | High ratio, slower |
+| `eLZO` | LZO | Very fast, moderate ratio; requires `HAVE_LIBLZO` |
+| `eZip` | zlib raw deflate | Use when the DEFLATE framing matters |
+| `eGZipFile` | gzip (`.gz`) | Recommended for interoperability; supports concatenated files |
+| `eZstd` | Zstandard | Best speed/ratio balance; requires `HAVE_LIBZSTD` |
+
+### Using algorithm-specific stream processors
+
+For full control over compression parameters (level, flags, dictionaries), use the algorithm-specific `StreamCompressor` and `StreamDecompressor` classes with `CCompressionIStream` / `CCompressionOStream`:
+
+```cpp
+#include <util/compress/zlib.hpp>
+#include <util/compress/stream.hpp>
+
+USING_NCBI_SCOPE;
+
+void WriteZlibHighCompression(const string& path, const string& data)
+{
+    CNcbiOfstream file(path.c_str(), ios::binary);
+
+    // Create a zlib compressor at the highest compression level
+    CZipStreamCompressor proc(CCompression::eLevel_Best);
+    CCompressionOStream out(file, &proc,
+                            CCompressionStream::fOwnProcessor);
+    out.write(data.data(), data.size());
+    out.Finalize();
+}
+```
+
+---
+
+## File-level compression with CCompressionFile
+
+Each algorithm provides a `CXxxCompressionFile` class (for example, `CZipCompressionFile`, `CBZip2CompressionFile`) derived from `CCompressionFile`. Use these to read or write compressed files in small chunks without loading the whole file into memory.
+
+```cpp
+#include <util/compress/zlib.hpp>
+
+USING_NCBI_SCOPE;
+
+void WriteGzipFile(const string& path)
+{
+    CZipCompressionFile gzf;
+    gzf.Open(path, CCompressionFile::eMode_Write);
+
+    string record = ">seq1\nACGTACGT\n";
+    gzf.Write(record.data(), record.size());
+    gzf.Close();
+}
+
+void ReadGzipFile(const string& path)
+{
+    CZipCompressionFile gzf;
+    gzf.Open(path, CCompressionFile::eMode_Read);
+
+    char buf[1024];
+    long n;
+    string content;
+    while ((n = gzf.Read(buf, sizeof(buf))) > 0) {
+        content.append(buf, n);
+    }
+    gzf.Close();
+    LOG_POST(content);
+}
+```
+
+`CCompressionFile` methods:
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `Open()` | `virtual bool Open(const string& path, EMode mode, ...)` | Opens a compressed file for reading or writing. Returns `false` on error. |
+| `Read()` | `virtual long Read(void* buf, size_t len)` | Reads up to `len` decompressed bytes. Returns 0 at end of file, -1 on error. |
+| `Write()` | `virtual long Write(const void* buf, size_t len)` | Writes `len` uncompressed bytes (stored compressed). |
+| `Close()` | `virtual bool Close(void)` | Flushes and closes the file. |
+
+---
+
+## Choosing a compression algorithm
+
+<Columns cols={2}>
+  <Card title="gzip / zlib — best compatibility" icon="file-archive">
+    Use `eGZipFile` when you need files readable by standard Unix tools (`gzip`, `gunzip`, `zcat`). Every NCBI platform ships zlib. The compression ratio is good; the speed is moderate.
+  </Card>
+  <Card title="Zstandard — best throughput" icon="zap">
+    Use `eZstd` for internal pipelines where both writer and reader are NCBI code. Zstd achieves higher decompression speeds than gzip at comparable or better ratios. Requires `HAVE_LIBZSTD`.
+  </Card>
+  <Card title="bzip2 — highest ratio" icon="compress">
+    Use `eBZip2` when compression ratio matters more than speed and you can tolerate slower compression. bzip2 is typically 10-40% smaller than gzip for text and sequence data.
+  </Card>
+  <Card title="LZO — lowest latency" icon="bolt">
+    Use `eLZO` when you need the fastest possible compression and decompression with minimal CPU overhead. The ratio is lower than gzip. Requires `HAVE_LIBLZO`.
+  </Card>
+</Columns>
+
+| Algorithm | Typical ratio | Compress speed | Decompress speed | External lib required |
+|-----------|--------------|----------------|------------------|-----------------------|
+| gzip | good | moderate | fast | No (embedded) |
+| bzip2 | best | slow | moderate | No (embedded) |
+| LZO | fair | very fast | very fast | Yes (`HAVE_LIBLZO`) |
+| Zstandard | good–best | very fast | very fast | Yes (`HAVE_LIBZSTD`) |
+
+---
+
+## Compression levels
+
+All algorithms map their native level range onto the toolkit's `ELevel` enum. You can use symbolic names rather than integers:
+
+```cpp
+// Symbolic level names are portable across all algorithms
+CZipCompression  fast_zip(CCompression::eLevel_Low);      // fast, less compact
+CBZip2Compression best_bz2(CCompression::eLevel_Best);    // slowest, most compact
+CZipCompression  default_zip;                             // eLevel_Default = balanced
+```
+
+The `eLevel_NoCompression` level stores data without compression (if the algorithm supports it — check with `HaveSupport(eFeature_NoCompression)`). For `eLevel_Default`, each algorithm chooses a balanced level appropriate for that format.
+
+---
+
+## Error handling
+
+All compression methods return `bool` to indicate success or failure; detailed error information is available via `GetErrorCode()` and `GetErrorDescription()`. Serious errors throw `CCompressionException`.
+
+```cpp
+CZipCompression zip;
+size_t dst_len = 0;
+vector<char> buf(1024);
+
+if (!zip.CompressBuffer(src, src_len, buf.data(), buf.size(), &dst_len)) {
+    int code = zip.GetErrorCode();
+    string desc = zip.GetErrorDescription();
+    LOG_POST(Error << "Compression failed (" << code << "): " << desc);
+}
+```

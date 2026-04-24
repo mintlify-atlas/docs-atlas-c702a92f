@@ -1,97 +1,75 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "NCBI C++ Toolkit: Bioinformatics C++ Library"
+description: "The NCBI C++ Toolkit is a comprehensive C++ library for building bioinformatics tools, handling biological sequence data, and accessing NCBI databases."
 ---
 
-## Setting up
+The NCBI C++ Toolkit is a large-scale, production-tested C++ library developed by the National Center for Biotechnology Information (NCBI). It provides everything you need to build bioinformatics applications: from a robust application framework and serialization infrastructure to the full BLAST sequence alignment engine and the Object Manager for working with biological sequence data.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Introduction" icon="book-open" href="/introduction">
+    Learn what the NCBI C++ Toolkit is, its architecture, and what you can build with it.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Write and compile your first NCBI C++ application in minutes.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Building the Toolkit" icon="hammer" href="/building">
+    Detailed instructions for configuring and building the toolkit from source.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api/corelib">
+    Browse the complete class and function reference for all toolkit modules.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Explore the toolkit
 
-Everything you need to create world-class documentation.
+<CardGroup cols={3}>
+  <Card title="Application Framework" icon="terminal" href="/core/application-framework">
+    CNcbiApplication, argument parsing, and configuration management.
+  </Card>
+  <Card title="Object Manager" icon="database" href="/data/object-manager">
+    Load and iterate over biological sequences, features, and annotations.
+  </Card>
+  <Card title="BLAST" icon="dna" href="/algorithms/blast">
+    Run local BLAST searches against sequence databases programmatically.
+  </Card>
+  <Card title="Serialization" icon="arrows-left-right" href="/data/serialization">
+    Read and write ASN.1, XML, and JSON data using generated C++ classes.
+  </Card>
+  <Card title="Networking" icon="network-wired" href="/network/connections-and-sockets">
+    Portable socket, HTTP, and NCBI service connection libraries.
+  </Card>
+  <Card title="Database API" icon="table" href="/data/database-api">
+    Unified interface for connecting to SQL databases from C++.
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Getting started
 
-## Need inspiration?
+<Steps>
+  <Step title="Get the source code">
+    Clone or download the public repository from GitHub:
+    ```bash
+    git clone https://github.com/ncbi/ncbi-cxx-toolkit-public.git
+    cd ncbi-cxx-toolkit-public
+    ```
+  </Step>
+  <Step title="Configure the build">
+    Run the configure script to detect your platform and generate build files:
+    ```bash
+    ./cmake-configure --with-build-root=build
+    ```
+  </Step>
+  <Step title="Build the toolkit">
+    Compile the core libraries:
+    ```bash
+    cd build/build && make -j4
+    ```
+  </Step>
+  <Step title="Write your first application">
+    Subclass `CNcbiApplication`, implement `Run()`, and link against the toolkit libraries. See the [Quickstart](/quickstart) for a complete working example.
+  </Step>
+</Steps>
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Note>
+The NCBI C++ Toolkit is a United States Government Work and is freely available for use by the public. It is used internally at NCBI to power tools including BLAST, Entrez, and the Sequence Viewer.
+</Note>

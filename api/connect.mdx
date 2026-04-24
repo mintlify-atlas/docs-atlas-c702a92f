@@ -1,0 +1,478 @@
+---
+title: "NCBI Connect Library: TCP Sockets and HTTP Session APIs"
+description: "Reference for CSocket, CListeningSocket, CHttpSession, CHttpRequest, CHttpResponse, STimeout, and related I/O stream classes in the NCBI Connect library."
+---
+
+The NCBI `connect` library wraps the platform C socket layer (`SOCK` API) with a clean C++ interface and adds higher-level HTTP session management. `CSocket` provides synchronous TCP communication; `CListeningSocket` handles incoming connections; `CHttpSession` and its request/response pair handle full HTTP/1.x and HTTP/2 client workflows including cookie management, redirects, and TLS credentials.
+
+---
+
+## STimeout
+
+`STimeout` is the fundamental timeout descriptor used throughout the connect library. It maps directly to the C `STimeout` struct.
+
+```cpp
+#include <connect/ncbi_socket.h>   // or via ncbi_socket.hpp
+
+struct STimeout {
+    unsigned int sec;   ///< whole seconds
+    unsigned int usec;  ///< microseconds (0..999999)
+};
+```
+
+<Expandable title="Special timeout constants">
+
+| Constant | Meaning |
+|---|---|
+| `kInfiniteTimeout` | Wait forever (pointer to a special STimeout{UINT_MAX,999999}) |
+| `kDefaultTimeout`  | Use the timeout previously set on this object |
+| `kZeroTimeout`     | Return immediately (non-blocking check) |
+
+</Expandable>
+
+```cpp
+STimeout timeout = {30, 0};           // 30-second timeout
+STimeout quick   = {0,  500000};      // 500 ms
+```
+
+---
+
+## CSocket
+
+`CSocket` is a C++ wrapper around the NCBI `SOCK` handle. It supports client-side TCP connections with configurable timeouts, non-blocking checks, and both binary and line-oriented I/O.
+
+```cpp
+#include <connect/ncbi_socket.hpp>
+
+CSocket sock("www.ncbi.nlm.nih.gov", 80);
+if (sock.GetStatus(eIO_Open) == eIO_Success) {
+    string request = "GET / HTTP/1.0\r\n\r\n";
+    sock.Write(request.data(), request.size());
+    string line;
+    while (sock.ReadLine(line) == eIO_Success)
+        cout << line << "\n";
+}
+```
+
+### Constructors
+
+```cpp
+// Default (unconnected) socket
+CSocket(void);
+
+// Connect immediately to host:port
+CSocket(const string&   host,
+        unsigned short  port,
+        const STimeout* timeout = kInfiniteTimeout,
+        TSOCK_Flags     flags   = fSOCK_LogDefault);
+
+// Connect using a "host:port" string
+CSocket(const string&   hostport,
+        const STimeout* timeout = kInfiniteTimeout,
+        TSOCK_Flags     flags   = fSOCK_LogDefault);
+```
+
+### Connect()
+
+```cpp
+EIO_Status Connect(const string&   host,
+                   unsigned short  port,
+                   const STimeout* timeout = kDefaultTimeout,
+                   TSOCK_Flags     flags   = fSOCK_LogDefault);
+
+EIO_Status Connect(const string&   hostport,
+                   const STimeout* timeout = kDefaultTimeout,
+                   TSOCK_Flags     flags   = fSOCK_LogDefault);
+```
+
+Establishes a TCP connection. Should only be called on an unconnected socket.
+
+<ParamField path="host" type="const string&" required>
+Hostname or text IP address (IPv4 or IPv6).
+</ParamField>
+<ParamField path="port" type="unsigned short" required>
+Port number in host byte order.
+</ParamField>
+<ParamField path="timeout" type="const STimeout*">
+Maximum time to wait. Pass `kInfiniteTimeout` to block indefinitely.
+</ParamField>
+
+<ResponseField name="return" type="EIO_Status">
+`eIO_Success` on success; `eIO_Timeout`, `eIO_Closed`, or `eIO_Unknown` on failure.
+</ResponseField>
+
+### Disconnect()
+
+```cpp
+EIO_Status Close(void);
+```
+
+Closes the socket and releases the underlying `SOCK` handle. After this call `GetStatus(eIO_Open)` returns `eIO_Closed`.
+
+### Read()
+
+```cpp
+EIO_Status Read(void*          buf,
+                size_t         size,
+                size_t*        n_read = 0,
+                EIO_ReadMethod how    = eIO_ReadPlain);
+```
+
+Reads up to `size` bytes into `buf`.
+
+<ParamField path="buf" type="void*" required>
+Destination buffer.
+</ParamField>
+<ParamField path="size" type="size_t" required>
+Maximum number of bytes to read.
+</ParamField>
+<ParamField path="n_read" type="size_t*">
+If non-null, receives the actual number of bytes read.
+</ParamField>
+<ParamField path="how" type="EIO_ReadMethod">
+`eIO_ReadPlain` (default) — return as soon as any data is available. `eIO_ReadPeek` — peek without consuming. `eIO_ReadPersist` — block until all `size` bytes are read or an error occurs.
+</ParamField>
+
+### ReadLine()
+
+```cpp
+EIO_Status ReadLine(string& str);
+EIO_Status ReadLine(char* buf, size_t size, size_t* n_read = 0);
+```
+
+Reads one line terminated by `\r\n`, `\n`, or `\0` (the terminator is discarded).
+
+<ParamField path="str" type="string&" required>
+Destination string; filled with the line content.
+</ParamField>
+
+### Write()
+
+```cpp
+EIO_Status Write(const void*     buf,
+                 size_t          size,
+                 size_t*         n_written = 0,
+                 EIO_WriteMethod how       = eIO_WritePersist);
+```
+
+Writes data to the socket.
+
+<ParamField path="buf" type="const void*" required>
+Source buffer.
+</ParamField>
+<ParamField path="size" type="size_t" required>
+Number of bytes to write.
+</ParamField>
+<ParamField path="how" type="EIO_WriteMethod">
+`eIO_WritePersist` (default) — retry until all bytes are sent. `eIO_WritePlain` — send what fits in one system call.
+</ParamField>
+
+### GetStatus()
+
+```cpp
+EIO_Status GetStatus(EIO_Event direction) const;
+```
+
+Returns the status of the last I/O operation in the given direction without performing any I/O.
+
+<ParamField path="direction" type="EIO_Event" required>
+`eIO_Open` (connection state), `eIO_Read`, or `eIO_Write`.
+</ParamField>
+
+### SetTimeout()
+
+```cpp
+EIO_Status SetTimeout(EIO_Event       event,
+                      const STimeout* timeout);
+```
+
+Sets the timeout for subsequent I/O in the specified direction.
+
+<ParamField path="event" type="EIO_Event" required>
+`eIO_Open`, `eIO_Read`, `eIO_Write`, `eIO_ReadWrite`, or `eIO_Close`.
+</ParamField>
+<ParamField path="timeout" type="const STimeout*" required>
+New timeout value; pass `kInfiniteTimeout` to disable.
+</ParamField>
+
+---
+
+## CListeningSocket
+
+`CListeningSocket` wraps the `LSOCK` handle for server-side socket operations.
+
+```cpp
+#include <connect/ncbi_socket.hpp>
+
+CListeningSocket lsock;
+lsock.Listen(8080, 128);
+
+CSocket* client = nullptr;
+while (lsock.Accept(client) == eIO_Success) {
+    // handle client in a thread
+}
+```
+
+### Listen()
+
+```cpp
+EIO_Status Listen(unsigned short port,
+                  unsigned short backlog = 64,
+                  TSOCK_Flags    flags   = fSOCK_LogDefault,
+                  ESwitch        ipv6    = eDefault);
+```
+
+Binds to `port` and starts listening.
+
+<ParamField path="port" type="unsigned short" required>
+Port number in host byte order. Pass `0` to let the OS choose.
+</ParamField>
+<ParamField path="backlog" type="unsigned short">
+Maximum pending connection queue length.
+</ParamField>
+
+### Accept()
+
+```cpp
+EIO_Status Accept(CSocket*&       sock,
+                  const STimeout* timeout = kInfiniteTimeout,
+                  TSOCK_Flags     flags   = fSOCK_LogDefault) const;
+
+EIO_Status Accept(CSocket&        sock,
+                  const STimeout* timeout = kInfiniteTimeout,
+                  TSOCK_Flags     flags   = fSOCK_LogDefault) const;
+```
+
+Waits for and accepts an incoming connection.
+
+<ParamField path="sock" type="CSocket*&" required>
+Receives a newly allocated `CSocket` (first overload) or fills an existing one (second overload). The caller owns the allocated socket.
+</ParamField>
+<ParamField path="timeout" type="const STimeout*">
+Maximum time to wait.
+</ParamField>
+
+### Close()
+
+```cpp
+EIO_Status Close(void);
+```
+
+Stops listening and releases the `LSOCK` handle.
+
+---
+
+## CConn_SocketStream
+
+`CConn_SocketStream` is an `iostream` built on top of a TCP connection. It integrates with the standard C++ I/O library.
+
+```cpp
+#include <connect/ncbi_conn_stream.hpp>
+
+CConn_SocketStream ss("eutils.ncbi.nlm.nih.gov", 80,
+                      0, fSOCK_LogDefault,
+                      &timeout);
+ss << "GET /entrez/eutils/efetch.fcgi?db=nucleotide&id=U00096 HTTP/1.0\r\n\r\n";
+ss.flush();
+
+string line;
+while (getline(ss, line))
+    cout << line << "\n";
+```
+
+### Constructor
+
+```cpp
+CConn_SocketStream(const string&   host,
+                   unsigned short  port,
+                   size_t          buf_size = kConn_DefaultBufSize,
+                   TSOCK_Flags     flags    = fSOCK_LogDefault,
+                   const STimeout* timeout  = kInfiniteTimeout);
+```
+
+---
+
+## CHttpSession
+
+`CHttpSession` manages persistent HTTP session state — cookies, default headers, TLS credentials, and protocol version — across multiple requests.
+
+```cpp
+#include <connect/ncbi_http_session.hpp>
+
+CHttpSession session;
+CHttpResponse resp = session.Get(CUrl("https://eutils.ncbi.nlm.nih.gov/..."));
+if (resp.GetStatusCode() == 200) {
+    NcbiStreamToString(&cout, resp.ContentStream());
+}
+```
+
+### NewRequest()
+
+```cpp
+CHttpRequest NewRequest(
+    const CUrl&          url,
+    ERequestMethod       method = eGet,
+    const CHttpParam&    param  = {}
+);
+```
+
+Creates a new `CHttpRequest` without opening a connection. Configure the request, then call `Execute()`.
+
+<ParamField path="url" type="const CUrl&" required>
+Target URL.
+</ParamField>
+<ParamField path="method" type="ERequestMethod">
+`eGet` (default), `ePost`, `ePut`, `eHead`, `ePatch`, or `eDelete`.
+</ParamField>
+
+<ResponseField name="return" type="CHttpRequest">
+Configured request object.
+</ResponseField>
+
+### Get() / Post() / Put() — shortcuts
+
+```cpp
+CHttpResponse Get(const CUrl&     url,
+                  const CTimeout& timeout = CTimeout(CTimeout::eDefault),
+                  THttpRetries    retries = null);
+
+CHttpResponse Post(const CUrl&     url,
+                   CTempString     data,
+                   CTempString     content_type = CTempString(),
+                   const CTimeout& timeout      = CTimeout(CTimeout::eDefault),
+                   THttpRetries    retries       = null);
+```
+
+Convenience methods that create a request, execute it, and return the response in one call.
+
+### SetCredentials()
+
+```cpp
+void SetCredentials(shared_ptr<CTlsCertCredentials> cred);
+```
+
+Sets TLS client certificate and private key for all requests in this session.
+
+---
+
+## CHttpRequest
+
+`CHttpRequest` represents a single outgoing HTTP request. Obtain instances from `CHttpSession::NewRequest()`.
+
+### Headers()
+
+```cpp
+CHttpHeaders& Headers(void);
+```
+
+Returns a mutable reference to the request headers. Use `CHttpHeaders::SetValue()` / `AddValue()` to modify them before calling `Execute()`.
+
+### ContentStream()
+
+```cpp
+CNcbiOstream& ContentStream(void);
+```
+
+Opens the connection and returns an output stream for writing request body data (for POST/PUT). Headers are sent automatically when the stream is opened. Call `Execute()` to finish.
+
+### SetTimeout()
+
+```cpp
+CHttpRequest& SetTimeout(const CTimeout& timeout);
+CHttpRequest& SetTimeout(unsigned int sec, unsigned int usec = 0);
+```
+
+Sets the I/O timeout for this specific request, overriding any session default.
+
+<ParamField path="timeout" type="const CTimeout&" required>
+New timeout value. Pass `CTimeout::eDefault` to use global defaults.
+</ParamField>
+
+<ResponseField name="return" type="CHttpRequest&">
+`*this`, enabling method chaining.
+</ResponseField>
+
+### Execute()
+
+```cpp
+CHttpResponse Execute(void);
+```
+
+Sends the request and blocks until a response is received. The content stream is flushed and closed. The request may be re-executed after modification.
+
+<ResponseField name="return" type="CHttpResponse">
+Response object with status code, headers, and content stream.
+</ResponseField>
+
+---
+
+## CHttpResponse
+
+`CHttpResponse` holds the server's response to a `CHttpRequest`.
+
+### GetStatusCode()
+
+```cpp
+int GetStatusCode(void) const;
+```
+
+Returns the HTTP status code (200, 404, etc.).
+
+### GetHeaderValue()
+
+```cpp
+// Via CHttpHeaders:
+const string& Headers().GetValue(CHttpHeaders::EHeaderName name) const;
+const string& Headers().GetValue(const string& name) const;
+```
+
+Retrieves the value of a response header. Returns an empty string if the header is absent.
+
+```cpp
+string ct = resp.Headers().GetValue(CHttpHeaders::eContentType);
+```
+
+### ContentStream()
+
+```cpp
+CNcbiIstream& ContentStream(void) const;
+```
+
+Returns an input stream for reading the response body. Throws `CHttpSessionException` if the status code indicates an error (non-2xx).
+
+### ErrorStream()
+
+```cpp
+CNcbiIstream& ErrorStream(void) const;
+```
+
+Returns the error response body stream (e.g. a 404 error page). Throws if the response has a success status code.
+
+---
+
+## Full HTTP example
+
+```cpp
+#include <connect/ncbi_http_session.hpp>
+
+CHttpSession session;
+
+// POST request with JSON body
+CHttpRequest req = session.NewRequest(
+    CUrl("https://api.example.com/data"),
+    CHttpSession::ePost);
+
+req.Headers().SetValue(CHttpHeaders::eContentType,
+                       "application/json");
+req.SetTimeout(10, 0);  // 10 seconds
+
+CNcbiOstream& body = req.ContentStream();
+body << R"({"accession":"NM_000518"})";
+
+CHttpResponse resp = req.Execute();
+if (resp.GetStatusCode() == 200) {
+    string result;
+    NcbiStreamToString(&result, resp.ContentStream());
+    cout << result << "\n";
+}
+```

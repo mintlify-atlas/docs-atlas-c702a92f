@@ -1,0 +1,256 @@
+---
+title: "Building the NCBI C++ Toolkit from Source"
+description: "Configure and build the NCBI C++ Toolkit using CMake or legacy autoconf, with compiler requirements and platform-specific notes for Linux, macOS, and Windows."
+---
+
+The NCBI C++ Toolkit supports two build systems: a CMake-based build (the recommended path for new work) and a legacy autoconf-based build (used on some internal NCBI systems). This page covers both, along with prerequisites, key configuration options, and platform-specific notes.
+
+## Prerequisites
+
+### Compiler and C++ standard
+
+The toolkit requires a C++17-capable compiler. CMake will attempt to use C++20 and fall back to C++17 when the compiler does not support it (see `src/build-system/cmake/CMakeChecks.compiler.cmake`).
+
+| Platform | Supported compilers |
+|---|---|
+| Linux | GCC 7.3+, Clang 7.0+, ICC 19.0+ |
+| macOS | Xcode / Apple Clang (recent Xcode release recommended) |
+| Windows | Visual Studio 2019 (`vs2019`) or Visual Studio 2022 (`vs2022`) |
+
+### Build tools
+
+- **CMake 3.15 or later** — required for the CMake build path
+- **GNU Make** or **Ninja** — on Linux/macOS (Ninja is faster for incremental builds)
+- **autoconf 2.69 or later** — only if you use the legacy autoconf path
+
+### Runtime dependencies
+
+The toolkit has a minimal set of mandatory third-party dependencies. Optional modules (networking with SSL, database access, compression) require additional libraries. The `--with-conan` flag to `cmake-configure` can resolve these automatically.
+
+| Dependency | Required for |
+|---|---|
+| OpenSSL | HTTPS connections in the `connect` module |
+| Berkeley DB / SQLite | Local DBAPI backends |
+| Boost | Some utility and unit-test modules |
+| PCRE | Regular expression support in `util` |
+| zlib / bzip2 / LZO | Compression in `util/compress` |
+
+<Note>
+At NCBI, most third-party dependencies are pre-installed in standard locations. External users who want a minimal build can start with just a C++ compiler and CMake, then add optional dependencies as needed.
+</Note>
+
+---
+
+## Build methods
+
+<Tabs>
+  <Tab title="CMake (recommended)">
+
+    The CMake build uses the `cmake-configure` script at the repository root, which wraps `src/build-system/cmake/cmake-cfg-unix.sh` (Linux/macOS) or `src/build-system/cmake/cmake-cfg-vs.bat` (Windows).
+
+    <Steps>
+      <Step title="Clone the repository">
+        ```bash
+        git clone https://github.com/ncbi/ncbi-cxx-toolkit-public.git
+        cd ncbi-cxx-toolkit-public
+        ```
+      </Step>
+
+      <Step title="Run cmake-configure">
+        The configure script creates a build directory and generates CMake build files. Run it from the repository root:
+
+        ```bash
+        # Debug build (default), static libraries
+        ./cmake-configure --with-build-root=build
+
+        # Release build, shared libraries
+        ./cmake-configure --without-debug --with-dll --with-build-root=build_release
+
+        # Specify a compiler explicitly (GCC 12.3.0 example)
+        ./cmake-configure GCC 12.3.0 --with-build-root=build
+        ```
+
+        Key options:
+
+        | Option | Effect |
+        |---|---|
+        | `--with-debug` | Debug build — extra runtime checks, no optimization (default) |
+        | `--without-debug` | Release build — optimized, no debug symbols |
+        | `--with-max-debug` | Enable extra STL and runtime checks on top of debug mode |
+        | `--with-symbols` | Retain debug symbols even in a release build |
+        | `--with-dll` | Build shared libraries instead of static ones |
+        | `--without-dll` | Build static libraries (default) |
+        | `--with-projects="LIST"` | Limit the build to specific subdirectories or a project list file |
+        | `--with-build-root=NAME` | Name for the build output directory |
+        | `--with-ccache` | Use `ccache` to speed up repeated compilations |
+        | `--with-distcc` | Distribute compilation with `distcc` |
+        | `--with-conan` | Use Conan to install missing third-party components |
+        | `--with-conan-build` | Use Conan to build and install missing components from source |
+        | `--with-install="DIR"` | Generate install rules targeting `DIR` |
+        | `--with-generator="X"` | Use a specific CMake generator (e.g. `"Ninja"`, `"Unix Makefiles"`) |
+      </Step>
+
+      <Step title="Build">
+        After configuration, the actual build directory is created under `<build-root>/build/`. Use `make` or `ninja` depending on the generator chosen:
+
+        ```bash
+        # Default: Unix Makefiles
+        cd build/build
+        make -j$(nproc)
+
+        # Or with Ninja (if you passed --with-generator="Ninja")
+        cd build/build
+        ninja -j$(nproc)
+        ```
+
+        To build only a specific application or library, target it by name:
+
+        ```bash
+        make -j4 basic_sample
+        ```
+      </Step>
+
+      <Step title="Run the sample application">
+        ```bash
+        # The basic sample is built under src/sample/app/basic/
+        ./src/sample/app/basic/basic_sample -k hello foo
+        ```
+      </Step>
+    </Steps>
+
+  </Tab>
+  <Tab title="Autoconf (legacy)">
+
+    The autoconf-based build has been the traditional method and is still supported on Linux and macOS. It uses the `configure` script generated from `src/build-system/configure.ac` (requires autoconf 2.69+).
+
+    <Steps>
+      <Step title="Generate configure (if needed)">
+        The pre-generated `configure` script is included in the repository. If you need to regenerate it:
+
+        ```bash
+        cd src/build-system
+        autoconf
+        ```
+      </Step>
+
+      <Step title="Run configure from a build directory">
+        Run configure from a separate build directory to keep the source tree clean:
+
+        ```bash
+        mkdir -p ../ncbi-build && cd ../ncbi-build
+        ../ncbi-cxx-toolkit-public/configure \
+            --with-build-root=. \
+            --without-debug
+        ```
+
+        Common configure options mirror the CMake ones:
+
+        | Option | Effect |
+        |---|---|
+        | `--with-debug` / `--without-debug` | Debug or release build |
+        | `--with-dll` / `--without-dll` | Shared or static libraries |
+        | `--with-lzo=DIR` | Use LZO compression library at `DIR` |
+        | `--with-z=DIR` | Use zlib at `DIR` |
+        | `--without-openssl` | Disable OpenSSL support |
+      </Step>
+
+      <Step title="Build">
+        ```bash
+        make -j$(nproc)
+        ```
+      </Step>
+    </Steps>
+
+    <Warning>
+    The autoconf path does not support Windows. On macOS, the CMake path is preferred because recent Xcode toolchains no longer ship all autoconf prerequisites.
+    </Warning>
+
+  </Tab>
+</Tabs>
+
+---
+
+## Platform-specific notes
+
+<CodeGroup>
+
+```bash Linux
+# Install build dependencies on Debian/Ubuntu
+sudo apt-get install -y \
+    build-essential cmake ninja-build \
+    libssl-dev zlib1g-dev libbz2-dev \
+    libboost-dev libsqlite3-dev
+
+# Configure and build
+./cmake-configure --with-build-root=build
+cd build/build && make -j$(nproc)
+```
+
+```bash macOS
+# Install build dependencies via Homebrew
+brew install cmake ninja openssl boost sqlite
+
+# On Apple Silicon, pass OpenSSL location explicitly if needed
+CMAKE_ARGS="-DOPENSSL_ROOT_DIR=$(brew --prefix openssl)" \
+  ./cmake-configure --with-build-root=build
+
+cd build/build && make -j$(sysctl -n hw.logicalcpu)
+```
+
+```bat Windows
+REM Use cmake-configure.bat from the repository root.
+REM Requires Visual Studio 2019 or 2022 and CMake 3.15+.
+
+cmake-configure.bat --with-build-root=build --without-debug
+
+REM Then open the generated .sln in Visual Studio, or build from the command line:
+cmake --build build\build --config Release --parallel
+```
+
+</CodeGroup>
+
+### Windows notes
+
+- Use `cmake-configure.bat`, which delegates to `src\build-system\cmake\cmake-cfg-vs.bat`.
+- Compiler selection is done by specifying `VS2019` or `VS2022` as the first argument to the bat file, or by running from the appropriate Visual Studio developer command prompt.
+- The Cygwin toolchain (`compilers/cygwin/`) is supported for Unix-style builds on Windows but is not the primary path.
+- Unicode builds are supported: when `_UNICODE` is defined, `NcbiSys_main` expands to `wmain` automatically (see `include/corelib/ncbiapp.hpp`).
+
+### macOS notes
+
+- Xcode (`compilers/xcode30_prj/`) project generation is available; pass `Xcode` as the compiler argument to `cmake-configure`.
+- Homebrew paths are searched automatically for dependencies on Apple Silicon and Intel Macs.
+- The precompiled header (`ncbi_pch.hpp`) speeds up macOS builds significantly; do not disable it unless debugging build issues.
+
+---
+
+## Building a subset of the toolkit
+
+Building the entire toolkit can take a long time. Use `--with-projects` to restrict the build to only the libraries and applications you need:
+
+```bash
+# Build only corelib and the serial module
+./cmake-configure --with-projects="corelib$;serial" --with-build-root=build_small
+
+# Build everything in the BLAST project list
+./cmake-configure \
+    --with-projects=scripts/projects/blast/project.lst \
+    --with-build-root=build_blast
+```
+
+<Tip>
+For day-to-day development on a single application, configure once with the full project list and then run `make <appname>` from the build directory. CMake's dependency tracking will only recompile what changed.
+</Tip>
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Write your first application" icon="rocket" href="/quickstart">
+    A complete walkthrough of CNcbiApplication, argument parsing, and building a minimal app.
+  </Card>
+  <Card title="Application framework reference" icon="terminal" href="/core/application-framework">
+    Detailed documentation on CNcbiApplication, diagnostics, config files, and more.
+  </Card>
+</CardGroup>

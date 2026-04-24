@@ -1,0 +1,299 @@
+---
+title: "NCBI Serialization Framework: ASN.1, XML, and JSON"
+description: "How to read and write NCBI data objects in ASN.1 text, ASN.1 binary, XML, and JSON formats using CObjectIStream, CObjectOStream, and serial hooks."
+---
+
+The NCBI serialization framework provides a uniform API for converting C++ data objects to and from ASN.1, XML, and JSON. The same generated object class can be written in any of these formats simply by choosing the appropriate stream type — no format-specific code needs to appear in the application logic.
+
+## Framework overview
+
+Every generated class inherits from `CSerialObject`, which provides `GetThisTypeInfo()` for runtime type introspection. The two principal stream classes are:
+
+- **`CObjectOStream`** — encodes an object and writes it to an output stream.
+- **`CObjectIStream`** — reads from an input stream and populates an object.
+
+Both classes are abstract; concrete instances are created by `Open()` or the equivalent factory helpers and live on the heap. The caller is responsible for deleting them (or wrapping them in `unique_ptr<>`).
+
+Format selection is done through the `ESerialDataFormat` enum:
+
+| Enum value | Format |
+|------------|--------|
+| `eSerial_AsnText` | ASN.1 text (human-readable) |
+| `eSerial_AsnBinary` | ASN.1 binary (compact, fast) |
+| `eSerial_Xml` | XML |
+| `eSerial_Json` | JSON |
+
+## CObjectOStream: writing objects
+
+### Creating a writer
+
+```cpp
+#include <serial/objostr.hpp>
+#include <serial/serial.hpp>
+
+// Write to a file in ASN.1 text format
+unique_ptr<CObjectOStream> out(
+    CObjectOStream::Open(eSerial_AsnText, "record.asn"));
+
+// Write to an existing CNcbiOstream
+unique_ptr<CObjectOStream> out2(
+    CObjectOStream::Open(eSerial_Xml, ncbi_ostream, eNoOwnership));
+```
+
+### Writing an object
+
+The `operator<<` overload (defined in `serial/serial.hpp`) forwards to the typed `Write()` helper:
+
+```cpp
+CRef<CSeq_entry> entry = /* ... */;
+*out << *entry;
+```
+
+Equivalently, call `Write()` explicitly:
+
+```cpp
+Write(*out, *entry);
+```
+
+## CObjectIStream: reading objects
+
+### Creating a reader
+
+```cpp
+#include <serial/objistr.hpp>
+
+// Read from a file
+unique_ptr<CObjectIStream> in(
+    CObjectIStream::Open(eSerial_AsnText, "record.asn"));
+
+// Read from an existing CNcbiIstream
+unique_ptr<CObjectIStream> in2(
+    CObjectIStream::Open(eSerial_Json, ncbi_istream, eNoOwnership));
+```
+
+### Reading an object
+
+```cpp
+CRef<CSeq_entry> entry(new CSeq_entry);
+*in >> *entry;
+```
+
+## Format examples
+
+<Tabs>
+  <Tab title="ASN.1 Text">
+    ASN.1 text is the traditional NCBI format. It is human-readable and round-trips without data loss.
+
+    **Writing:**
+    ```cpp
+    #include <serial/objostr.hpp>
+    #include <serial/serial.hpp>
+    #include <objects/seq/Bioseq.hpp>
+
+    USING_SCOPE(ncbi);
+    USING_SCOPE(objects);
+
+    // Write a CBioseq to stdout in ASN.1 text
+    unique_ptr<CObjectOStream> out(
+        CObjectOStream::Open(eSerial_AsnText, cout, eNoOwnership));
+    *out << bioseq;
+    ```
+
+    **Reading:**
+    ```cpp
+    unique_ptr<CObjectIStream> in(
+        CObjectIStream::Open(eSerial_AsnText, "seq.asn"));
+    CRef<CBioseq> bioseq(new CBioseq);
+    *in >> *bioseq;
+    ```
+
+    **Typical output:**
+    ```
+    Bioseq ::= {
+      id { genbank { accession "U00001", version 1 } },
+      inst { repr raw, mol dna, length 2532, ... }
+    }
+    ```
+  </Tab>
+
+  <Tab title="XML">
+    XML output follows the NCBI XML schema derived from ASN.1 module definitions.
+
+    **Writing:**
+    ```cpp
+    unique_ptr<CObjectOStream> out(
+        CObjectOStream::Open(eSerial_Xml, "record.xml"));
+    *out << seq_entry;
+    ```
+
+    **Reading:**
+    ```cpp
+    unique_ptr<CObjectIStream> in(
+        CObjectIStream::Open(eSerial_Xml, "record.xml"));
+    CRef<CSeq_entry> entry(new CSeq_entry);
+    *in >> *entry;
+    ```
+
+    **Typical output (fragment):**
+    ```xml
+    <Seq-entry>
+      <Seq-entry_seq>
+        <Bioseq>
+          <Bioseq_id> ... </Bioseq_id>
+          <Bioseq_inst> ... </Bioseq_inst>
+        </Bioseq>
+      </Seq-entry_seq>
+    </Seq-entry>
+    ```
+  </Tab>
+
+  <Tab title="JSON">
+    JSON output follows the same field names as the ASN.1 specification with camel-case mapping.
+
+    **Writing:**
+    ```cpp
+    unique_ptr<CObjectOStream> out(
+        CObjectOStream::Open(eSerial_Json, "record.json"));
+    *out << seq_feat;
+    ```
+
+    **Reading:**
+    ```cpp
+    unique_ptr<CObjectIStream> in(
+        CObjectIStream::Open(eSerial_Json, "record.json"));
+    CRef<CSeq_feat> feat(new CSeq_feat);
+    *in >> *feat;
+    ```
+
+    **Typical output (fragment):**
+    ```json
+    {
+      "data": {
+        "gene": {
+          "locus": "recA",
+          "locus-tag": "b2699"
+        }
+      },
+      "location": { ... }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Working with generated classes
+
+All object classes in `include/objects/` are generated from ASN.1 module specifications by the `datatool` utility. Generated classes:
+
+- Inherit from `CSerialObject` (via `CObject`).
+- Expose `GetTypeInfo()` / `GetThisTypeInfo()` for runtime type reflection.
+- Use `IsSet*()` / `CanGet*()` / `Get*()` / `Set*()` / `Reset*()` accessors (see the [ASN.1 Data Types](./asn1-data-types) page for the full pattern).
+
+```cpp
+#include <objects/seqfeat/Seq_feat.hpp>
+#include <objects/seqfeat/Gene_ref.hpp>
+
+CRef<CSeq_feat> feat(new CSeq_feat);
+
+// Set gene data
+feat->SetData().SetGene().SetLocus("recA");
+feat->SetData().SetGene().SetLocus_tag("b2699");
+
+// Write to ASN.1 text
+unique_ptr<CObjectOStream> out(
+    CObjectOStream::Open(eSerial_AsnText, cout, eNoOwnership));
+*out << *feat;
+```
+
+## Serial hooks
+
+Hooks allow you to intercept read or write operations on specific object types or members without modifying generated code. This is useful for logging, validation, transformation, or skipping unwanted data.
+
+### Read hook example
+
+```cpp
+#include <serial/objhook.hpp>
+
+class CMyReadHook : public CReadObjectHook
+{
+public:
+    void ReadObject(CObjectIStream& in, const CObjectInfo& info) override
+    {
+        // Default read
+        DefaultRead(in, info);
+
+        // Post-processing
+        CSeq_feat* feat = CTypeConverter<CSeq_feat>::SafeCast(info.GetObjectPtr());
+        if (feat) {
+            // validate or transform feat
+        }
+    }
+};
+
+// Install on a stream
+unique_ptr<CObjectIStream> in(
+    CObjectIStream::Open(eSerial_AsnText, "feats.asn"));
+
+CObjectTypeInfo feat_type = CType<CSeq_feat>();
+feat_type.SetLocalReadHook(*in, new CMyReadHook);
+
+CRef<CSeq_feat> feat(new CSeq_feat);
+*in >> *feat; // hook fires during this read
+```
+
+### Write hook example
+
+```cpp
+#include <serial/objhook.hpp>
+
+class CMyWriteHook : public CWriteObjectHook
+{
+public:
+    void WriteObject(CObjectOStream& out, const CConstObjectInfo& info) override
+    {
+        // optionally transform before writing
+        DefaultWrite(out, info);
+    }
+};
+
+unique_ptr<CObjectOStream> out(
+    CObjectOStream::Open(eSerial_Xml, "out.xml"));
+
+CObjectTypeInfo feat_type = CType<CSeq_feat>();
+feat_type.SetLocalWriteHook(*out, new CMyWriteHook);
+
+*out << *feat;
+```
+
+<Tip>
+Use `SetLocalReadHook()` / `SetLocalWriteHook()` to restrict a hook to one stream instance. Use `SetGlobalReadHook()` / `SetGlobalWriteHook()` to apply it process-wide. Local hooks always take precedence over global hooks.
+</Tip>
+
+## Reading multiple objects from a stream
+
+A single ASN.1 file may contain a sequence of top-level objects. Read them in a loop:
+
+```cpp
+unique_ptr<CObjectIStream> in(
+    CObjectIStream::Open(eSerial_AsnBinary, "batch.asn.bin"));
+
+while (in->HaveMoreData()) {
+    CRef<CSeq_entry> entry(new CSeq_entry);
+    *in >> *entry;
+    // process entry
+}
+```
+
+<Note>
+`HaveMoreData()` checks for end-of-stream but does not guarantee that the next object is well-formed. Wrap the read in a try/catch block for production code.
+</Note>
+
+## Convenience: MSerial_AsnText
+
+For quick debugging, the `MSerial_*` stream manipulators let you write objects inline to a standard C++ stream:
+
+```cpp
+#include <serial/serial.hpp>
+
+NcbiCout << MSerial_AsnText << *feat << NcbiEndl;
+NcbiCout << MSerial_Json    << *feat << NcbiEndl;
+```
